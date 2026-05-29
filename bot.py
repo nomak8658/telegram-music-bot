@@ -56,63 +56,38 @@ user_search_results: dict[int, list] = {}
 # Bot username — filled on startup
 BOT_USERNAME: str = ""
 
-# ─── Audio Cache (query → Telegram file_id) — Redis + fallback ────────────────
-import redis as _redis_lib
+# ─── Audio Cache (query → Telegram file_id) — Volume persistent ───────────────
+# /data مُثبّت كـ Railway Volume → يبقى بين إعادة التشغيل
+_CACHE_FILE = pathlib.Path("/data/audio_cache.json")
+_audio_cache: dict[str, str] = {}
 
-_CACHE_FILE = pathlib.Path("/tmp/audio_cache.json")
-_local_cache: dict[str, str] = {}
-_redis_client: "_redis_lib.Redis | None" = None
-
-def _init_redis() -> None:
-    global _redis_client
-    url = os.environ.get("REDIS_URL", "")
-    if not url:
-        return
+def _load_audio_cache() -> None:
+    global _audio_cache
     try:
-        _redis_client = _redis_lib.from_url(url, decode_responses=True, socket_connect_timeout=3)
-        _redis_client.ping()
-        logger.info("Redis connected ✅")
-    except Exception as e:
-        logger.warning(f"Redis not available, using file cache: {e}")
-        _redis_client = None
+        _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if _CACHE_FILE.exists():
+            _audio_cache = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+            logger.info(f"Cache loaded: {len(_audio_cache)} tracks")
+    except Exception:
+        _audio_cache = {}
 
-def _load_local_cache() -> None:
-    global _local_cache
-    if _CACHE_FILE.exists():
-        try:
-            _local_cache = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
-            logger.info(f"Local cache loaded: {len(_local_cache)} tracks")
-        except Exception:
-            _local_cache = {}
+def _save_audio_cache() -> None:
+    try:
+        _CACHE_FILE.write_text(json.dumps(_audio_cache, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 def _ck(query: str) -> str:
     return re.sub(r"\s+", " ", query.strip().lower())
 
 def cache_get(query: str) -> str | None:
-    key = _ck(query)
-    if _redis_client:
-        try:
-            return _redis_client.get(f"audio:{key}")
-        except Exception:
-            pass
-    return _local_cache.get(key)
+    return _audio_cache.get(_ck(query))
 
 def cache_set(query: str, file_id: str) -> None:
-    key = _ck(query)
-    if _redis_client:
-        try:
-            _redis_client.set(f"audio:{key}", file_id)
-            return
-        except Exception:
-            pass
-    _local_cache[key] = file_id
-    try:
-        _CACHE_FILE.write_text(json.dumps(_local_cache, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    _audio_cache[_ck(query)] = file_id
+    _save_audio_cache()
 
-_load_local_cache()
-_init_redis()
+_load_audio_cache()
 
 # كلمات النايتكور/المسرع للفلترة
 _NIGHTCORE_WORDS = {"nightcore", "sped up", "sped-up", "speed up", "spedup", "slowed", "نايتكور", "مسرع", "مبطأ"}
