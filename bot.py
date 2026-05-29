@@ -1119,16 +1119,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop.run_in_executor(None, nogomistars_search, query),
     )
 
-    # ── رتّب: mp3j (SC+YT) أول، nogomistars ثاني — sm3ha محذوف (بدون عناوين) ──
+    # ── رتّب: mp3j أول، sm3ha ثاني، nogomistars ثالث ───────────────
     combined = []
     for r in mp3j_res:
         if not r.get("source"):
             r["source"] = "mp3j"
         combined.append(r)
+    for r in sm3ha_res:
+        combined.append(r)          # عناوين حقيقية لو موجودة أو "Query (N)"
     for r in nogomi_res:
         combined.append(r)
 
-    combined = combined[:10]          # أقصى 10 نتائج
+    # أزل التكرار حسب yt_id
+    seen_yt: set[str] = set()
+    deduped = []
+    for r in combined:
+        yt = r.get("yt_id") or r.get("id")
+        if yt and yt in seen_yt:
+            continue
+        if yt:
+            seen_yt.add(yt)
+        deduped.append(r)
+    combined = deduped[:10]          # أقصى 10 نتائج
 
     if not combined:
         await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
