@@ -9,7 +9,6 @@ from datetime import datetime
 
 import requests
 import websockets
-import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -112,37 +111,6 @@ YT_SEARCH_HEADERS = {
 }
 
 
-# ─── YouTube search via yt-dlp ────────────────────────────────────────────────
-
-def ytdlp_search(query: str, max_results: int = 10) -> list:
-    """يبحث في يوتيوب بـ yt-dlp ويرجع قائمة نتائج بأسماء حقيقية."""
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": True,
-            "noplaylist": False,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
-        results = []
-        for entry in (info.get("entries") or [])[:max_results]:
-            yt_id = entry.get("id", "")
-            title = entry.get("title", "")
-            duration = int(entry.get("duration") or 0)
-            if yt_id and title:
-                results.append({
-                    "source": "yt",
-                    "yt_id": yt_id,
-                    "title": title,
-                    "duration": duration,
-                    "yt_url": f"https://www.youtube.com/watch?v={yt_id}",
-                })
-        logger.info(f"ytdlp_search found {len(results)} results for: {query}")
-        return results
-    except Exception as e:
-        logger.error(f"ytdlp_search error: {e}")
-        return []
 
 
 def sm3ha_search_first(query: str) -> str | None:
@@ -266,39 +234,6 @@ def mp3j_download(track_id: str, query: str, title: str) -> str | None:
     except Exception as e:
         logger.error(f"Download error: {e}")
         return None
-
-
-# ─── yt-dlp download ──────────────────────────────────────────────────────────
-
-def ytdlp_download(yt_url: str) -> tuple[str | None, str, int]:
-    """
-    يحمّل صوت يوتيوب بـ yt-dlp بدون حاجة لـ ffmpeg (m4a/webm مباشر).
-    يرجع (مسار الملف, العنوان, المدة بالثواني) أو (None, '', 0).
-    """
-    try:
-        tmp_dir = tempfile.mkdtemp()
-        ydl_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
-            "outtmpl": os.path.join(tmp_dir, "%(title)s.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "socket_timeout": 30,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(yt_url, download=True)
-            title = info.get("title", "YouTube Audio") if info else "YouTube Audio"
-            duration = int(info.get("duration", 0)) if info else 0
-
-        # ابحث عن الملف المحمّل
-        for fname in os.listdir(tmp_dir):
-            fpath = os.path.join(tmp_dir, fname)
-            if os.path.isfile(fpath):
-                return fpath, title, duration
-        return None, title, duration
-    except Exception as e:
-        logger.error(f"ytdlp_download error: {e}")
-        return None, "", 0
 
 
 # ─── ar.savemp3.net API ───────────────────────────────────────────────────────
@@ -472,18 +407,11 @@ async def _download_and_send_yt(
     """
     loop = asyncio.get_event_loop()
 
-    await wait_msg.edit_text("⏳ جاري التحميل...")
+    await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
 
-    # yt-dlp أولاً — الأسرع والأموثوق
     file_path, title, duration_sec = await loop.run_in_executor(
-        None, ytdlp_download, yt_url
+        None, savemp3_full_download, yt_url
     )
-    # احتياط: savemp3.net إذا فشل yt-dlp
-    if not file_path or not os.path.exists(file_path):
-        await wait_msg.edit_text("⏳ جاري التحويل...")
-        file_path, title, duration_sec = await loop.run_in_executor(
-            None, savemp3_full_download, yt_url
-        )
 
     if not file_path or not os.path.exists(file_path):
         await wait_msg.edit_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
@@ -549,7 +477,7 @@ async def send_audio_file(
 
 async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     """يوت + اسم أغنية: يجيب أول نتيجة ويحمّلها فوراً بدون أزرار.
-    الترتيب: nogomistars → sm3ha.io → mp3j.cc → YouTube scraping → savemp3.net
+    الترتيب: sm3ha.io → mp3j.cc → savemp3.net
     """
     wait_msg = await msg.reply_text(
         f"🎵 جاري البحث والتحميل: *{query}*...",
@@ -558,24 +486,58 @@ async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE
 
     loop = asyncio.get_event_loop()
 
-    # ── المصدر الأول: YouTube search via yt-dlp ────────────────────
-    yt_results = await loop.run_in_executor(None, ytdlp_search, query)
-    if yt_results:
-        track = yt_results[0]
-        title = track["title"]
-        yt_url = track["yt_url"]
-        await wait_msg.edit_text(
-            f"⏳ جاري التحميل...\n🎵 *{title}*",
-            parse_mode="Markdown",
-        )
-        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
-        return
-
-    # ── المصدر الثاني: sm3ha.io ────────────────────────────────────
+    # ── المصدر الأول: sm3ha.io ──────────────────────────────────────
     yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
     if yt_url:
         await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
         return
+
+    # ── المصدر الثاني: mp3j.cc (SoundCloud) ────────────────────────
+    results = await loop.run_in_executor(None, mp3j_search, query)
+    if results:
+        track    = results[0]
+        track_id = track["id"]
+        title    = track["title"]
+        duration = track["duration"]
+        query_q  = track["query"]
+        artist, song_title = split_artist_title(title)
+
+        await wait_msg.edit_text(
+            f"⏳ جاري التحضير...\n🎵 *{title}*",
+            parse_mode="Markdown",
+        )
+        ok = await mp3j_prepare(track_id, query_q)
+        if ok:
+            await wait_msg.edit_text(
+                f"📥 جاري التحميل...\n🎵 *{title}*",
+                parse_mode="Markdown",
+            )
+            file_path = await loop.run_in_executor(None, mp3j_download, track_id, query_q, title)
+            if file_path and os.path.exists(file_path):
+                try:
+                    size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                    if size_mb > 50:
+                        await wait_msg.edit_text(
+                            f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
+                        )
+                        return
+                    sent = await send_audio_file(
+                        context.bot, msg.chat_id, file_path,
+                        title=song_title or title,
+                        duration_str=duration,
+                        performer=artist,
+                    )
+                    if sent:
+                        await wait_msg.delete()
+                    else:
+                        await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
+                    return
+                finally:
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            os.unlink(file_path)
+                        except Exception:
+                            pass
 
     await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
 
@@ -598,10 +560,8 @@ async def yot_youtube(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     """
     شغل [اسم الأغنية]:
-      1. يبحث في يوتيوب ويجيب رابط المقطع
-      2. يحط الرابط في ar.savemp3.net
-      3. يحمّل الـ MP3 ويرسله
-    مستقل تماماً عن بحث ويوت.
+      1. يبحث في sm3ha.io ويجيب رابط المقطع
+      2. يحوّله عبر ar.savemp3.net
     """
     wait_msg = await msg.reply_text(
         f"🔍 جاري البحث عن: *{query}*...",
@@ -609,13 +569,11 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     )
     loop = asyncio.get_event_loop()
 
-    # الخطوة 1: يبحث في يوتيوب ويجيب الرابط
-    yt_url = await loop.run_in_executor(None, youtube_search_first, query)
+    yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
     if not yt_url:
-        await wait_msg.edit_text("❌ ما لقيت الأغنية في يوتيوب، جرب كلمة ثانية.")
+        await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
         return
 
-    # الخطوة 2+3: يحط الرابط في ar.savemp3.net ويحمّله
     await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
 
 
@@ -754,7 +712,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await yot_youtube(msg, query, context)
         return
 
-    # ── بحث: قائمة أزرار (YouTube search via yt-dlp) ───────────────
+    # ── بحث: قائمة أزرار (mp3j.cc SoundCloud) ──────────────────────
     wait_msg = await msg.reply_text(
         f"🔍 جاري البحث عن: *{query}*...",
         parse_mode="Markdown",
@@ -763,30 +721,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loop = asyncio.get_event_loop()
     user_id = update.effective_user.id
 
-    # ── المصدر الأول: YouTube search via yt-dlp ────────────────────
-    results = await loop.run_in_executor(None, ytdlp_search, query)
+    # ── المصدر الأول: mp3j.cc (SoundCloud) ─────────────────────────
+    results = await loop.run_in_executor(None, mp3j_search, query)
     if results:
+        for r in results:
+            r["source"] = "mp3j"
         user_search_results[user_id] = results
         keyboard = []
         for i, r in enumerate(results):
-            dur = f" [{fmt_sec(r['duration'])}]" if r.get("duration") else ""
-            label = f"🎵 {r['title'][:50]}{dur}"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"dl_{i}")])
-        await wait_msg.edit_text(
-            f"🎶 نتائج لـ *{query}* — اختار الأغنية:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown",
-        )
-        return
-
-    # ── المصدر الثاني: mp3j.cc (SoundCloud) ────────────────────────
-    mp3j_results = await loop.run_in_executor(None, mp3j_search, query)
-    if mp3j_results:
-        for r in mp3j_results:
-            r["source"] = "mp3j"
-        user_search_results[user_id] = mp3j_results
-        keyboard = []
-        for i, r in enumerate(mp3j_results):
             dur   = f" [{r['duration']}]" if r["duration"] else ""
             label = f"🎵 {r['title'][:48]}{dur}"
             keyboard.append([InlineKeyboardButton(label, callback_data=f"dl_{i}")])
@@ -795,6 +737,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
+        return
+
+    # ── المصدر الثاني: sm3ha.io (تحميل مباشر لأول نتيجة) ──────────
+    yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
+    if yt_url:
+        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
         return
 
     await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
@@ -824,53 +772,6 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏳ جاري التحميل...\n🎵 *{title}*",
         parse_mode="Markdown",
     )
-
-    # ── yt / nogomi: YouTube URL → yt-dlp → savemp3 احتياط ──────────
-    if source in ("yt", "nogomi"):
-        yt_url = track["yt_url"]
-        loop   = asyncio.get_event_loop()
-        # yt-dlp أولاً
-        file_path, dl_title, duration_sec = await loop.run_in_executor(
-            None, ytdlp_download, yt_url
-        )
-        # احتياط: savemp3
-        if not file_path or not os.path.exists(file_path):
-            file_path, dl_title, duration_sec = await loop.run_in_executor(
-                None, savemp3_full_download, yt_url
-            )
-        if not file_path or not os.path.exists(file_path):
-            await cb.edit_message_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
-            return
-        real_title = dl_title or title
-        real_artist, real_song = split_artist_title(real_title)
-        try:
-            size_mb = os.path.getsize(file_path) / (1024 * 1024)
-            if size_mb > 50:
-                await cb.edit_message_text(
-                    f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
-                )
-                return
-            await cb.edit_message_text(
-                f"📤 جاري الإرسال...\n🎵 *{real_title}*",
-                parse_mode="Markdown",
-            )
-            sent = await send_audio_file(
-                context.bot, update.effective_chat.id, file_path,
-                title=real_song or real_title,
-                duration_str=fmt_sec(duration_sec),
-                performer=real_artist,
-            )
-            if sent:
-                await cb.delete_message()
-            else:
-                await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
-        finally:
-            if file_path and os.path.exists(file_path):
-                try:
-                    os.unlink(file_path)
-                except Exception:
-                    pass
-        return
 
     # ── mp3j.cc: WebSocket prepare → direct MP3 download ───────────
     track_id = track["id"]
