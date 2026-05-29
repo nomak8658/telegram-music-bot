@@ -111,6 +111,51 @@ YT_SEARCH_HEADERS = {
 }
 
 
+# ─── nogomistars.com API ───────────────────────────────────────────────────────
+
+def _query_to_nogomi_subdomain(query: str) -> str | None:
+    """يحول نص البحث إلى punycode subdomain لـ nogomistars.com"""
+    try:
+        slug = query.strip().replace(" ", "-")
+        encoded = slug.encode("idna").decode("ascii")
+        return encoded
+    except Exception as e:
+        logger.error(f"nogomi subdomain encode error: {e}")
+        return None
+
+
+def nogomistars_search(query: str) -> list:
+    """يبحث في nogomistars.com ويرجع قائمة نتائج مع YouTube IDs."""
+    subdomain = _query_to_nogomi_subdomain(query)
+    if not subdomain:
+        return []
+    try:
+        url = f"https://{subdomain}.nogomistars.com/"
+        r = requests.get(url, headers=YT_SEARCH_HEADERS, timeout=15)
+        r.raise_for_status()
+        # استخراج كل song-card: YouTube ID من الـ thumbnail + العنوان من alt
+        cards = re.findall(
+            r'<a[^>]+class="song-card"[^>]*>.*?'
+            r'<img[^>]+src="https://i\.ytimg\.com/vi/([\w\-]{11})/[^"]*"[^>]*alt="([^"]*)"',
+            r.text, re.DOTALL
+        )
+        results = []
+        for yt_id, alt_text in cards[:10]:
+            title = alt_text.replace(" نجومي", "").strip()
+            title = re.sub(r"\s+", " ", title).strip()
+            results.append({
+                "source": "nogomi",
+                "yt_id": yt_id,
+                "title": title,
+                "yt_url": f"https://www.youtube.com/watch?v={yt_id}",
+            })
+        logger.info(f"nogomistars found {len(results)} results for: {query}")
+        return results
+    except Exception as e:
+        logger.error(f"nogomistars_search error: {e}")
+        return []
+
+
 def sm3ha_search_first(query: str) -> str | None:
     """يبحث في sm3ha.io ويرجع رابط يوتيوب لأول نتيجة، أو None."""
     try:
@@ -474,84 +519,93 @@ async def send_audio_file(
 # ─── يوت: تحميل فوري (SoundCloud أول نتيجة) ──────────────────────────────────
 
 async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
-    """يوت + اسم أغنية: يجيب أول نتيجة ويحمّلها فوراً بدون أزرار."""
+    """يوت + اسم أغنية: يجيب أول نتيجة ويحمّلها فوراً بدون أزرار.
+    الترتيب: nogomistars → sm3ha.io → mp3j.cc → YouTube scraping → savemp3.net
+    """
     wait_msg = await msg.reply_text(
         f"🎵 جاري البحث والتحميل: *{query}*...",
         parse_mode="Markdown",
     )
 
     loop = asyncio.get_event_loop()
-    results = await loop.run_in_executor(None, mp3j_search, query)
 
-    if not results:
-        # ── Fallback 2: sm3ha.io ────────────────────────────────────
+    # ── المصدر الأول: nogomistars.com ──────────────────────────────
+    nogomi_results = await loop.run_in_executor(None, nogomistars_search, query)
+    if nogomi_results:
+        track = nogomi_results[0]
+        title = track["title"]
+        yt_url = track["yt_url"]
         await wait_msg.edit_text(
-            f"🔄 جاري البحث عن: *{query}*...",
+            f"⏳ جاري التحميل...\n🎵 *{title}*",
             parse_mode="Markdown",
         )
-        yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
-        # ── Fallback 3: YouTube scraping ────────────────────────────
-        if not yt_url:
-            yt_url = await loop.run_in_executor(None, youtube_search_first, query)
-        if not yt_url:
-            await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
-            return
         await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
         return
 
-    track    = results[0]
-    track_id = track["id"]
-    title    = track["title"]
-    duration = track["duration"]
-    query_q  = track["query"]
-
-    artist, song_title = split_artist_title(title)
-
+    # ── المصدر الثاني: sm3ha.io ────────────────────────────────────
     await wait_msg.edit_text(
-        f"⏳ جاري التحضير...\n🎵 *{title}*",
+        f"🔄 جاري البحث عن: *{query}*...",
         parse_mode="Markdown",
     )
-
-    ok = await mp3j_prepare(track_id, query_q)
-    if not ok:
-        await _fallback_search_download(title, wait_msg, msg.chat_id, context)
+    yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
+    if yt_url:
+        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
         return
 
-    await wait_msg.edit_text(
-        f"📥 جاري التحميل...\n🎵 *{title}*",
-        parse_mode="Markdown",
-    )
+    # ── المصدر الثالث: mp3j.cc (SoundCloud) ────────────────────────
+    results = await loop.run_in_executor(None, mp3j_search, query)
+    if results:
+        track    = results[0]
+        track_id = track["id"]
+        title    = track["title"]
+        duration = track["duration"]
+        query_q  = track["query"]
+        artist, song_title = split_artist_title(title)
 
-    file_path = await loop.run_in_executor(None, mp3j_download, track_id, query_q, title)
-
-    if not file_path or not os.path.exists(file_path):
-        await _fallback_search_download(title, wait_msg, msg.chat_id, context)
-        return
-
-    try:
-        size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        if size_mb > 50:
-            await wait_msg.edit_text(
-                f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
-            )
-            return
-
-        sent = await send_audio_file(
-            context.bot, msg.chat_id, file_path,
-            title=song_title or title,
-            duration_str=duration,
-            performer=artist,
+        await wait_msg.edit_text(
+            f"⏳ جاري التحضير...\n🎵 *{title}*",
+            parse_mode="Markdown",
         )
-        if sent:
-            await wait_msg.delete()
-        else:
-            await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
-    finally:
-        if file_path and os.path.exists(file_path):
-            try:
-                os.unlink(file_path)
-            except Exception:
-                pass
+        ok = await mp3j_prepare(track_id, query_q)
+        if ok:
+            await wait_msg.edit_text(
+                f"📥 جاري التحميل...\n🎵 *{title}*",
+                parse_mode="Markdown",
+            )
+            file_path = await loop.run_in_executor(None, mp3j_download, track_id, query_q, title)
+            if file_path and os.path.exists(file_path):
+                try:
+                    size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                    if size_mb > 50:
+                        await wait_msg.edit_text(
+                            f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
+                        )
+                        return
+                    sent = await send_audio_file(
+                        context.bot, msg.chat_id, file_path,
+                        title=song_title or title,
+                        duration_str=duration,
+                        performer=artist,
+                    )
+                    if sent:
+                        await wait_msg.delete()
+                    else:
+                        await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
+                    return
+                finally:
+                    if file_path and os.path.exists(file_path):
+                        try:
+                            os.unlink(file_path)
+                        except Exception:
+                            pass
+
+    # ── المصدر الرابع: YouTube scraping → ar.savemp3.net ───────────
+    yt_url = await loop.run_in_executor(None, youtube_search_first, query)
+    if yt_url:
+        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
+        return
+
+    await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
 
 
 # ─── يوت: تحميل يوتيوب مباشرة ─────────────────────────────────────────────────
@@ -729,48 +783,72 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── بحث: قائمة أزرار ───────────────────────────────────────────
+    # الترتيب: nogomistars → sm3ha.io → mp3j.cc → YouTube scraping
     wait_msg = await msg.reply_text(
         f"🔍 جاري البحث عن: *{query}*...",
         parse_mode="Markdown",
     )
 
-    loop    = asyncio.get_event_loop()
-    results = await loop.run_in_executor(None, mp3j_search, query)
+    loop = asyncio.get_event_loop()
+    user_id = update.effective_user.id
 
-    if not results:
-        # ── Fallback 2: sm3ha.io ──────────────────────────────────
+    # ── المصدر الأول: nogomistars.com ──────────────────────────────
+    results = await loop.run_in_executor(None, nogomistars_search, query)
+    if results:
+        user_search_results[user_id] = results
+        keyboard = []
+        for i, r in enumerate(results):
+            label = f"🎵 {r['title'][:55]}"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"dl_{i}")])
         await wait_msg.edit_text(
-            f"🔄 جاري البحث عن: *{query}*...",
+            f"🎶 نتائج لـ *{query}* — اختار الأغنية:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown",
         )
-        yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
-        # ── Fallback 3: YouTube scraping ─────────────────────────
-        if not yt_url:
-            yt_url = await loop.run_in_executor(None, youtube_search_first, query)
-        if not yt_url:
-            await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
-            return
+        return
+
+    # ── المصدر الثاني: sm3ha.io ────────────────────────────────────
+    await wait_msg.edit_text(
+        f"🔄 جاري البحث عن: *{query}*...",
+        parse_mode="Markdown",
+    )
+    yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
+    if yt_url:
         await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
         return
 
-    user_id = update.effective_user.id
-    user_search_results[user_id] = results
+    # ── المصدر الثالث: mp3j.cc (SoundCloud) ────────────────────────
+    results = await loop.run_in_executor(None, mp3j_search, query)
+    if results:
+        # أضف source لكل نتيجة
+        for r in results:
+            r["source"] = "mp3j"
+        user_search_results[user_id] = results
+        keyboard = []
+        for i, r in enumerate(results):
+            dur   = f" [{r['duration']}]" if r["duration"] else ""
+            label = f"🎵 {r['title'][:48]}{dur}"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"dl_{i}")])
+        await wait_msg.edit_text(
+            f"🎶 نتائج لـ *{query}* — اختار الأغنية:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+        return
 
-    keyboard = []
-    for i, r in enumerate(results):
-        dur   = f" [{r['duration']}]" if r["duration"] else ""
-        label = f"🎵 {r['title'][:48]}{dur}"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"dl_{i}")])
+    # ── المصدر الرابع: YouTube scraping → ar.savemp3.net ───────────
+    yt_url = await loop.run_in_executor(None, youtube_search_first, query)
+    if yt_url:
+        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
+        return
 
-    await wait_msg.edit_text(
-        f"🎶 نتائج لـ *{query}* — اختار الأغنية:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
-    )
+    await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
 
 
 async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج الأزرار (بحث فقط)."""
+    """معالج الأزرار (بحث فقط).
+    يدعم نتائج nogomistars (source=nogomi) ونتائج mp3j.cc (source=mp3j).
+    """
     cb = update.callback_query
     await cb.answer()
 
@@ -782,17 +860,59 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cb.edit_message_text("❌ انتهت صلاحية النتائج، ابحث مرة ثانية.")
         return
 
-    track    = results[idx]
-    track_id = track["id"]
-    title    = track["title"]
-    duration = track["duration"]
-    query    = track["query"]
+    track  = results[idx]
+    title  = track["title"]
+    source = track.get("source", "mp3j")
     artist, song_title = split_artist_title(title)
 
     await cb.edit_message_text(
-        f"⏳ جاري التحضير...\n🎵 *{title}*",
+        f"⏳ جاري التحميل...\n🎵 *{title}*",
         parse_mode="Markdown",
     )
+
+    # ── nogomistars: استخدم YouTube URL → ar.savemp3.net ───────────
+    if source == "nogomi":
+        yt_url = track["yt_url"]
+        loop   = asyncio.get_event_loop()
+        file_path, dl_title, duration_sec = await loop.run_in_executor(
+            None, savemp3_full_download, yt_url
+        )
+        if not file_path or not os.path.exists(file_path):
+            await cb.edit_message_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
+            return
+        try:
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            if size_mb > 50:
+                await cb.edit_message_text(
+                    f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
+                )
+                return
+            await cb.edit_message_text(
+                f"📤 جاري الإرسال...\n🎵 *{title}*",
+                parse_mode="Markdown",
+            )
+            sent = await send_audio_file(
+                context.bot, update.effective_chat.id, file_path,
+                title=song_title or title,
+                duration_str=fmt_sec(duration_sec),
+                performer=artist,
+            )
+            if sent:
+                await cb.delete_message()
+            else:
+                await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
+        finally:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.unlink(file_path)
+                except Exception:
+                    pass
+        return
+
+    # ── mp3j.cc: WebSocket prepare → direct MP3 download ───────────
+    track_id = track["id"]
+    duration = track["duration"]
+    query    = track["query"]
 
     ok = await mp3j_prepare(track_id, query)
     if not ok:
