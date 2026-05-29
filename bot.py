@@ -5,6 +5,7 @@ import asyncio
 import tempfile
 import re
 import time
+import pathlib
 from datetime import datetime
 
 import requests
@@ -54,6 +55,40 @@ user_search_results: dict[int, list] = {}
 
 # Bot username — filled on startup
 BOT_USERNAME: str = ""
+
+# ─── Audio Cache (query → Telegram file_id) ───────────────────────────────────
+_CACHE_FILE = pathlib.Path("/tmp/audio_cache.json")
+_audio_cache: dict[str, str] = {}
+
+def _load_audio_cache() -> None:
+    global _audio_cache
+    if _CACHE_FILE.exists():
+        try:
+            _audio_cache = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+            logger.info(f"Cache loaded: {len(_audio_cache)} tracks")
+        except Exception:
+            _audio_cache = {}
+
+def _save_audio_cache() -> None:
+    try:
+        _CACHE_FILE.write_text(json.dumps(_audio_cache, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+def _ck(query: str) -> str:
+    return re.sub(r"\s+", " ", query.strip().lower())
+
+def cache_get(query: str) -> str | None:
+    return _audio_cache.get(_ck(query))
+
+def cache_set(query: str, file_id: str) -> None:
+    _audio_cache[_ck(query)] = file_id
+    _save_audio_cache()
+
+_load_audio_cache()
+
+# كلمات النايتكور/المسرع للفلترة
+_NIGHTCORE_WORDS = {"nightcore", "sped up", "sped-up", "speed up", "spedup", "slowed", "نايتكور", "مسرع", "مبطأ"}
 
 YOUTUBE_REGEX = re.compile(
     r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?(?:.*&)?v=|youtu\.be/)[\w\-]{11}"
@@ -222,21 +257,43 @@ def sm3ha_search_first(query: str) -> str | None:
 
 
 def sm3ha_search_all(query: str) -> list:
-    """يبحث في sm3ha.io ويرجع قائمة نتائج مع العناوين."""
+    """يبحث في sm3ha.io ويرجع قائمة نتائج مع العناوين الحقيقية."""
     try:
         slug = query.replace(" ", "-")
         url  = f"https://v1.sm3ha.io/s/{slug}"
         r    = requests.get(url, headers=YT_SEARCH_HEADERS, timeout=15)
-        vids = re.findall(r'href="#([A-Za-z0-9_-]{11})"', r.text)
-        # استخراج العناوين من الـ HTML
-        titles = re.findall(r'<h\d[^>]*>\s*([^<]{3,80}?)\s*</h\d>', r.text)
+        html = r.text
+
+        vids = re.findall(r'href="#([A-Za-z0-9_-]{11})"', html)
+        if not vids:
+            return []
+
+        # محاولة 1: JSON objects تحتوي videoId + title
+        titles: list[str] = []
+        for block in re.findall(r'\{[^{}]{10,400}\}', html):
+            if '"videoId"' in block or '"video_id"' in block:
+                t = re.search(r'"title"\s*:\s*"([^"]{3,100})"', block)
+                if t:
+                    titles.append(t.group(1))
+
+        # محاولة 2: data-title أو aria-label
         if not titles:
-            titles = re.findall(r'title="([^"]{3,80})"', r.text)
+            titles = re.findall(r'(?:data-title|aria-label)="([^"]{3,100})"', html)
+
+        # محاولة 3: عناوين من script tags (JSON arrays)
+        if not titles:
+            for script in re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL):
+                found = re.findall(r'"title"\s*:\s*"([^"]{3,100})"', script)
+                if found:
+                    titles.extend(found)
+                    break
+
         results = []
         for i, vid in enumerate(vids[:8]):
-            title = titles[i].strip() if i < len(titles) else f"{query} — نتيجة {i+1}"
+            title = titles[i].strip() if i < len(titles) else ""
             results.append({"title": title, "yt_id": vid, "source": "sm3ha"})
-        logger.info(f"sm3ha_search_all found {len(results)} for: {query}")
+
+        logger.info(f"sm3ha_search_all found {len(results)} (titles={len(titles)}) for: {query}")
         return results
     except Exception as e:
         logger.error(f"sm3ha_search_all error: {e}")
@@ -515,50 +572,34 @@ async def _download_and_send_yt(
     wait_msg,
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
+    cache_key: str = "",
 ) -> None:
-    """
-    يأخذ رابط يوتيوب → يحمّله عبر savemp3.net → يرسله.
-    يستخدم wait_msg للتحديث أثناء العملية.
-    """
+    """يأخذ رابط يوتيوب → يحمّله عبر savemp3.net → يرسله ويحفظ في الكاش."""
     loop = asyncio.get_event_loop()
-
     await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
-
-    file_path, title, duration_sec = await loop.run_in_executor(
-        None, savemp3_full_download, yt_url
-    )
-
+    file_path, title, duration_sec = await loop.run_in_executor(None, savemp3_full_download, yt_url)
     if not file_path or not os.path.exists(file_path):
         await wait_msg.edit_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
         return
-
     try:
         size_mb = os.path.getsize(file_path) / (1024 * 1024)
         if size_mb > 50:
-            await wait_msg.edit_text(
-                f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
-            )
+            await wait_msg.edit_text(f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB.")
             return
-
         artist, song_title = split_artist_title(title)
         duration_str = fmt_sec(duration_sec)
-
-        sent = await send_audio_file(
-            context.bot, chat_id, file_path,
-            title=song_title or title,
-            duration_str=duration_str,
-            performer=artist,
-        )
-        if sent:
+        ok, file_id = await send_audio_file(context.bot, chat_id, file_path,
+            title=song_title or title, duration_str=duration_str, performer=artist)
+        if ok:
+            if cache_key and file_id:
+                cache_set(cache_key, file_id)
             await wait_msg.delete()
         else:
             await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
     finally:
         if file_path and os.path.exists(file_path):
-            try:
-                os.unlink(file_path)
-            except Exception:
-                pass
+            try: os.unlink(file_path)
+            except Exception: pass
 
 
 async def _download_and_send_yt_cb(
@@ -566,6 +607,7 @@ async def _download_and_send_yt_cb(
     cb,
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
+    cache_key: str = "",
 ) -> None:
     """نفس _download_and_send_yt لكن يستخدم callback_query بدل wait_msg."""
     loop = asyncio.get_event_loop()
@@ -580,10 +622,14 @@ async def _download_and_send_yt_cb(
             await cb.edit_message_text(f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB.")
             return
         artist, song_title = split_artist_title(title)
-        sent = await send_audio_file(context.bot, chat_id, file_path,
+        ok, file_id = await send_audio_file(context.bot, chat_id, file_path,
             title=song_title or title, duration_str=fmt_sec(duration_sec), performer=artist)
-        if sent: await cb.delete_message()
-        else: await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
+        if ok:
+            if cache_key and file_id:
+                cache_set(cache_key, file_id)
+            await cb.delete_message()
+        else:
+            await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
     finally:
         if file_path and os.path.exists(file_path):
             try: os.unlink(file_path)
@@ -599,37 +645,65 @@ async def send_audio_file(
     title: str,
     duration_str: str,
     performer: str = "",
-) -> bool:
-    """يرسل ملف الصوت بالديزاين المطلوب ويرجع True إذا نجح."""
+) -> tuple[bool, str]:
+    """يرسل ملف الصوت ويرجع (نجح, file_id) للكاش."""
     caption = build_caption(BOT_USERNAME, duration_str)
     try:
         with open(file_path, "rb") as f:
-            await bot.send_audio(
+            sent_msg = await bot.send_audio(
                 chat_id=chat_id,
                 audio=f,
                 title=title,
                 performer=performer or None,
                 caption=caption,
             )
-        return True
+        return True, sent_msg.audio.file_id
     except Exception as e:
         logger.error(f"send_audio error: {e}")
+        return False, ""
+
+
+async def send_cached(bot, chat_id: int, file_id: str, title: str, duration_str: str, performer: str = "") -> bool:
+    """يرسل الأغنية من الكاش (file_id) بثانية."""
+    caption = build_caption(BOT_USERNAME, duration_str)
+    try:
+        await bot.send_audio(chat_id=chat_id, audio=file_id,
+            title=title, performer=performer or None, caption=caption)
+        return True
+    except Exception as e:
+        logger.warning(f"cache send failed (stale file_id?): {e}")
         return False
 
 
 # ─── يوت: تحميل فوري (SoundCloud أول نتيجة) ──────────────────────────────────
 
 async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
-    """يوت + اسم أغنية: يجيب أول نتيجة ويحمّلها فوراً بدون أزرار.
-    الترتيب: mp3j.cc → sm3ha.io → savemp3.net → nogomistars.com
+    """يوت + اسم أغنية: يجيب أول نتيجة ويحمّلها فوراً.
+    الترتيب: sm3ha.io → mp3j.cc → savemp3.net → nogomistars.com
     """
+    # ── كاش: إذا سبق وشُغّلت هذي الأغنية تجي بثانية ───────────────
+    cached_fid = cache_get(query)
+    if cached_fid:
+        ok = await send_cached(context.bot, msg.chat_id, cached_fid, query, "")
+        if ok:
+            return
+
     wait_msg = await msg.reply_text(
-        f"🎵 جاري البحث والتحميل: *{query}*...",
-        parse_mode="Markdown",
-    )
+        f"🎵 جاري البحث والتحميل: *{query}*...", parse_mode="Markdown")
     loop = asyncio.get_event_loop()
 
-    # ── 1: mp3j.cc ──────────────────────────────────────────────────
+    # ── 1: sm3ha.io → 2: savemp3.net ────────────────────────────────
+    sm3ha_results = await loop.run_in_executor(None, sm3ha_search_all, query)
+    # فلتر النايتكور/المسرع
+    clean = [r for r in sm3ha_results if not any(w in r["title"].lower() for w in _NIGHTCORE_WORDS)]
+    yt_id = clean[0]["yt_id"] if clean else (sm3ha_results[0]["yt_id"] if sm3ha_results else None)
+    if yt_id:
+        await _download_and_send_yt(
+            f"https://www.youtube.com/watch?v={yt_id}",
+            wait_msg, msg.chat_id, context, cache_key=query)
+        return
+
+    # ── 3: mp3j.cc ──────────────────────────────────────────────────
     results = await loop.run_in_executor(None, mp3j_search, query)
     if results:
         track    = results[0]
@@ -649,21 +723,18 @@ async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE
                     if size_mb > 50:
                         await wait_msg.edit_text(f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB.")
                         return
-                    sent = await send_audio_file(context.bot, msg.chat_id, file_path,
+                    ok2, file_id = await send_audio_file(context.bot, msg.chat_id, file_path,
                         title=song_title or title, duration_str=duration, performer=artist)
-                    if sent: await wait_msg.delete()
-                    else: await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
+                    if ok2:
+                        if file_id: cache_set(query, file_id)
+                        await wait_msg.delete()
+                    else:
+                        await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
                     return
                 finally:
                     if file_path and os.path.exists(file_path):
                         try: os.unlink(file_path)
                         except Exception: pass
-
-    # ── 2: sm3ha.io → 3: savemp3.net ────────────────────────────────
-    yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
-    if yt_url:
-        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
-        return
 
     # ── 4: nogomistars.com ──────────────────────────────────────────
     nogomi_results = await loop.run_in_executor(None, nogomistars_search, query)
@@ -675,19 +746,22 @@ async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE
         if file_path and os.path.exists(file_path):
             try:
                 artist, song_title = split_artist_title(dl_title)
-                sent = await send_audio_file(context.bot, msg.chat_id, file_path,
+                ok2, file_id = await send_audio_file(context.bot, msg.chat_id, file_path,
                     title=song_title or dl_title, duration_str="", performer=artist)
-                if sent: await wait_msg.delete()
-                else: await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
+                if ok2:
+                    if file_id: cache_set(query, file_id)
+                    await wait_msg.delete()
+                else:
+                    await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
                 return
             finally:
                 if os.path.exists(file_path):
                     try: os.unlink(file_path)
                     except Exception: pass
-        # nogomistars وجد لكن التحميل المباشر فشل → savemp3
-        yt_id = track.get("yt_id")
-        if yt_id:
-            await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id}", wait_msg, msg.chat_id, context)
+        yt_id2 = track.get("yt_id")
+        if yt_id2:
+            await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id2}",
+                wait_msg, msg.chat_id, context, cache_key=query)
             return
 
     await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
@@ -711,12 +785,27 @@ async def yot_youtube(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     """
     شغل [اسم الأغنية]:
-      الترتيب: mp3j.cc → sm3ha.io → savemp3.net → nogomistars.com
+      الترتيب: sm3ha.io → mp3j.cc → savemp3.net → nogomistars.com
     """
+    cached_fid = cache_get(query)
+    if cached_fid:
+        ok = await send_cached(context.bot, msg.chat_id, cached_fid, query, "")
+        if ok:
+            return
+
     wait_msg = await msg.reply_text(f"🔍 جاري البحث عن: *{query}*...", parse_mode="Markdown")
     loop = asyncio.get_event_loop()
 
-    # ── 1: mp3j.cc ──────────────────────────────────────────────────
+    # ── 1: sm3ha.io → 2: savemp3.net ────────────────────────────────
+    sm3ha_res = await loop.run_in_executor(None, sm3ha_search_all, query)
+    clean = [r for r in sm3ha_res if not any(w in r["title"].lower() for w in _NIGHTCORE_WORDS)]
+    yt_id = clean[0]["yt_id"] if clean else (sm3ha_res[0]["yt_id"] if sm3ha_res else None)
+    if yt_id:
+        await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id}",
+            wait_msg, msg.chat_id, context, cache_key=query)
+        return
+
+    # ── 3: mp3j.cc ──────────────────────────────────────────────────
     mp3j_results = await loop.run_in_executor(None, mp3j_search, query)
     if mp3j_results:
         track    = mp3j_results[0]
@@ -731,21 +820,18 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
             file_path = await loop.run_in_executor(None, mp3j_download, track_id, query_q, title_mp)
             if file_path and os.path.exists(file_path):
                 try:
-                    sent = await send_audio_file(context.bot, msg.chat_id, file_path,
+                    ok2, file_id = await send_audio_file(context.bot, msg.chat_id, file_path,
                         title=song_title or title_mp, duration_str=track["duration"], performer=artist)
-                    if sent: await wait_msg.delete()
-                    else: await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
+                    if ok2:
+                        if file_id: cache_set(query, file_id)
+                        await wait_msg.delete()
+                    else:
+                        await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
                     return
                 finally:
                     if os.path.exists(file_path):
                         try: os.unlink(file_path)
                         except Exception: pass
-
-    # ── 2: sm3ha.io → 3: savemp3.net ────────────────────────────────
-    yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
-    if yt_url:
-        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
-        return
 
     # ── 4: nogomistars.com ──────────────────────────────────────────
     nogomi_results = await loop.run_in_executor(None, nogomistars_search, query)
@@ -757,18 +843,22 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
         if file_path and os.path.exists(file_path):
             try:
                 artist, song_title = split_artist_title(dl_title)
-                sent = await send_audio_file(context.bot, msg.chat_id, file_path,
+                ok2, file_id = await send_audio_file(context.bot, msg.chat_id, file_path,
                     title=song_title or dl_title, duration_str="", performer=artist)
-                if sent: await wait_msg.delete()
-                else: await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
+                if ok2:
+                    if file_id: cache_set(query, file_id)
+                    await wait_msg.delete()
+                else:
+                    await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
                 return
             finally:
                 if os.path.exists(file_path):
                     try: os.unlink(file_path)
                     except Exception: pass
-        yt_id = track.get("yt_id")
-        if yt_id:
-            await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id}", wait_msg, msg.chat_id, context)
+        yt_id2 = track.get("yt_id")
+        if yt_id2:
+            await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id2}",
+                wait_msg, msg.chat_id, context, cache_key=query)
             return
 
     await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
@@ -933,12 +1023,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop.run_in_executor(None, nogomistars_search, query),
     )
 
-    # ── رتّب: mp3j أول، sm3ha ثاني، nogomistars أخير ──────────────
+    # ── رتّب: sm3ha أول، mp3j ثاني، nogomistars أخير ──────────────
     combined = []
+    for r in sm3ha_res:
+        combined.append(r)
     for r in mp3j_res:
         r["source"] = "mp3j"
-        combined.append(r)
-    for r in sm3ha_res:
         combined.append(r)
     for r in nogomi_res:
         combined.append(r)
@@ -1007,24 +1097,26 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"📤 جاري الإرسال...\n🎵 *{title}*",
                     parse_mode="Markdown",
                 )
-                sent = await send_audio_file(
+                ok2, file_id = await send_audio_file(
                     context.bot, update.effective_chat.id, file_path,
-                    title=song_title or title,
-                    duration_str="",
-                    performer=artist,
-                )
-                if sent:
+                    title=song_title or title, duration_str="", performer=artist)
+                if ok2:
+                    if file_id: cache_set(title, file_id)
                     await cb.delete_message()
                 else:
                     await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
                 return
             finally:
                 if os.path.exists(file_path):
-                    try:
-                        os.unlink(file_path)
-                    except Exception:
-                        pass
-        await _fallback_search_download(title, cb.message, update.effective_chat.id, context)
+                    try: os.unlink(file_path)
+                    except Exception: pass
+        # تحميل مباشر فشل → savemp3
+        yt_id = track.get("yt_id")
+        if yt_id:
+            await _download_and_send_yt_cb(f"https://www.youtube.com/watch?v={yt_id}",
+                cb, update.effective_chat.id, context, cache_key=title)
+        else:
+            await _fallback_search_download(title, cb.message, update.effective_chat.id, context)
         return
 
     # ── mp3j.cc: WebSocket prepare → direct MP3 download ───────────
@@ -1062,22 +1154,18 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
         )
 
-        sent = await send_audio_file(
+        ok2, file_id = await send_audio_file(
             context.bot, update.effective_chat.id, file_path,
-            title=song_title or title,
-            duration_str=duration,
-            performer=artist,
-        )
-        if sent:
+            title=song_title or title, duration_str=duration, performer=artist)
+        if ok2:
+            if file_id: cache_set(title, file_id)
             await cb.delete_message()
         else:
             await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
     finally:
         if file_path and os.path.exists(file_path):
-            try:
-                os.unlink(file_path)
-            except Exception:
-                pass
+            try: os.unlink(file_path)
+            except Exception: pass
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
