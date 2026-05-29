@@ -1090,6 +1090,23 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source = track.get("source", "mp3j")
     artist, song_title = split_artist_title(title)
 
+    # ── كاش: لو شُغّلت قبل تجي بثانية ──────────────────────────────
+    cached_fid = cache_get(title)
+    if cached_fid:
+        caption = build_caption(BOT_USERNAME, "")
+        try:
+            await context.bot.send_audio(
+                chat_id=update.effective_chat.id,
+                audio=cached_fid,
+                title=song_title or title,
+                performer=artist or None,
+                caption=caption,
+            )
+            await cb.delete_message()
+            return
+        except Exception:
+            pass  # الكاش منتهي → كمّل التحميل الطبيعي
+
     await cb.edit_message_text(
         f"⏳ جاري التحميل...\n🎵 *{title}*",
         parse_mode="Markdown",
