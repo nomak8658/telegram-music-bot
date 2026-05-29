@@ -389,6 +389,7 @@ def _savemp3_action(action_hash: str, payload: list) -> str:
         },
         timeout=60,
     )
+    r.encoding = "utf-8"
     return r.text
 
 
