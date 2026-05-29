@@ -723,18 +723,34 @@ async def _download_and_send_yt(
     context: ContextTypes.DEFAULT_TYPE,
     cache_key: str = "",
 ) -> bool:
-    """يأخذ رابط يوتيوب → يحمّله عبر yt-dlp ثم savemp3 احتياطياً → يرسله. يرجع True إذا نجح."""
+    """
+    يحمّل YouTube ويرسله.
+    الترتيب: yt-dlp → savemp3 → nogomistars
+    يرجع True إذا نجح.
+    """
     loop = asyncio.get_event_loop()
+    file_path, title, duration_sec = "", "", 0
 
-    # yt-dlp أولاً
+    # ── 1: yt-dlp ────────────────────────────────────────────────────
     file_path, title, duration_sec = await loop.run_in_executor(None, ytdlp_download, yt_url)
 
-    # savemp3 احتياطياً
+    # ── 2: savemp3 ───────────────────────────────────────────────────
     if not file_path or not os.path.exists(file_path):
-        logger.info(f"ytdlp failed for {yt_url}, trying savemp3")
+        logger.info(f"ytdlp failed → savemp3: {yt_url}")
         file_path, title, duration_sec = await loop.run_in_executor(
             None, savemp3_full_download, yt_url
         )
+
+    # ── 3: nogomistars (بحث بالعنوان) ───────────────────────────────
+    if (not file_path or not os.path.exists(file_path)) and cache_key:
+        logger.info(f"savemp3 failed → nogomistars: {cache_key}")
+        nogomi = await loop.run_in_executor(None, nogomistars_search, cache_key)
+        if nogomi:
+            fp2, t2, d2 = await loop.run_in_executor(
+                None, nogomistars_download, nogomi[0]["dl_url"], nogomi[0]["title"]
+            )
+            if fp2 and os.path.exists(fp2):
+                file_path, title, duration_sec = fp2, t2, d2
 
     if not file_path or not os.path.exists(file_path):
         return False
@@ -767,20 +783,35 @@ async def _download_and_send_yt_cb(
     context: ContextTypes.DEFAULT_TYPE,
     cache_key: str = "",
 ) -> None:
-    """يحمّل YouTube ويرسله — يجرب yt-dlp أولاً ثم savemp3 احتياطياً."""
+    """
+    يحمّل YouTube ويرسله عبر callback_query.
+    الترتيب: yt-dlp → savemp3 → nogomistars
+    """
     loop = asyncio.get_event_loop()
     await cb.edit_message_text("⏳ جاري التحميل...")
 
-    # ── 1: yt-dlp (الأسرع والأكثر موثوقية) ─────────────────────────
+    # ── 1: yt-dlp ────────────────────────────────────────────────────
     file_path, title, duration_sec = await loop.run_in_executor(None, ytdlp_download, yt_url)
 
-    # ── 2: savemp3 احتياطياً إذا فشل yt-dlp ─────────────────────────
+    # ── 2: savemp3 ───────────────────────────────────────────────────
     if not file_path or not os.path.exists(file_path):
-        logger.info(f"ytdlp failed for {yt_url}, falling back to savemp3")
+        logger.info(f"ytdlp failed → savemp3: {yt_url}")
         await cb.edit_message_text("⏳ جاري التحويل (مصدر احتياطي)...")
         file_path, title, duration_sec = await loop.run_in_executor(
             None, savemp3_full_download, yt_url
         )
+
+    # ── 3: nogomistars (بحث بالعنوان) ───────────────────────────────
+    if (not file_path or not os.path.exists(file_path)) and cache_key:
+        logger.info(f"savemp3 failed → nogomistars: {cache_key}")
+        await cb.edit_message_text("⏳ جاري البحث في مصدر ثالث...")
+        nogomi = await loop.run_in_executor(None, nogomistars_search, cache_key)
+        if nogomi:
+            fp2, t2, d2 = await loop.run_in_executor(
+                None, nogomistars_download, nogomi[0]["dl_url"], nogomi[0]["title"]
+            )
+            if fp2 and os.path.exists(fp2):
+                file_path, title, duration_sec = fp2, t2, d2
 
     if not file_path or not os.path.exists(file_path):
         await cb.edit_message_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
