@@ -288,31 +288,26 @@ def sm3ha_search_all(query: str) -> list:
         if not vids:
             return []
 
-        # محاولة 1: JSON objects تحتوي videoId + title
-        titles: list[str] = []
-        for block in re.findall(r'\{[^{}]{10,400}\}', html):
-            if '"videoId"' in block or '"video_id"' in block:
-                t = re.search(r'"title"\s*:\s*"([^"]{3,100})"', block)
-                if t:
-                    titles.append(t.group(1))
-
-        # محاولة 2: data-title أو aria-label
+        # العناوين في alt="..." على صور الـ thumbnail (ytimg)
+        # كل صورة لها data-src="https://i.ytimg.com/vi/{ID}/..." + alt="{العنوان}"
+        titles: list[str] = re.findall(
+            r'data-src="https://i\.ytimg\.com/vi/[\w\-]{11}/[^"]*"[^>]{0,300}?alt="([^"]*)"',
+            html,
+            re.DOTALL,
+        )
+        # احتياط: alt قد يكون قبل data-src في بعض الحالات
         if not titles:
-            titles = re.findall(r'(?:data-title|aria-label)="([^"]{3,100})"', html)
-
-        # محاولة 3: عناوين من script tags (JSON arrays)
-        if not titles:
-            for script in re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL):
-                found = re.findall(r'"title"\s*:\s*"([^"]{3,100})"', script)
-                if found:
-                    titles.extend(found)
-                    break
+            titles = re.findall(
+                r'alt="([^"]*)"[^>]{0,300}?data-src="https://i\.ytimg\.com',
+                html,
+                re.DOTALL,
+            )
+        # تنظيف القيم الفارغة أو اسم الموقع
+        titles = [t.strip() for t in titles if t.strip() and t.strip() != "سمعها"]
 
         results = []
         for i, vid in enumerate(vids[:8]):
-            raw_title = titles[i].strip() if i < len(titles) else ""
-            # إذا ما قدرنا نستخرج العنوان نولّد اسم وصفي من الكويري
-            title = raw_title if raw_title else f"{query} ({i + 1})"
+            title = titles[i] if i < len(titles) else query
             results.append({"title": title, "yt_id": vid, "source": "sm3ha"})
 
         logger.info(f"sm3ha_search_all found {len(results)} (titles={len(titles)}) for: {query}")
@@ -599,6 +594,64 @@ def savemp3_full_download(yt_url: str) -> tuple[str | None, str, int]:
         return None, title, duration
 
 
+# ─── yt-dlp: تحميل YouTube مباشرة ────────────────────────────────────────────
+
+def ytdlp_download(yt_url: str) -> tuple[str | None, str, int]:
+    """
+    يحمّل صوت YouTube عبر yt-dlp (الأسرع والأكثر موثوقية).
+    يرجع (مسار الملف, العنوان, المدة بالثواني) أو (None, '', 0).
+    المتصل مسؤول عن حذف الملف بعد الاستخدام.
+    """
+    try:
+        import yt_dlp  # type: ignore
+    except ImportError:
+        logger.error("yt-dlp غير مثبّت")
+        return None, "", 0
+
+    tmp_dir = tempfile.mkdtemp()
+    outtmpl  = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+    ydl_opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best",
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0",
+        },
+    }
+    title    = ""
+    duration = 0
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(yt_url, download=True)
+        if info:
+            title    = info.get("title", "YouTube Audio")
+            duration = int(info.get("duration") or 0)
+        files = [f for f in os.listdir(tmp_dir) if os.path.isfile(os.path.join(tmp_dir, f))]
+        if not files:
+            logger.error("ytdlp: no file after download")
+            return None, title or "YouTube Audio", duration
+        file_path = os.path.join(tmp_dir, files[0])
+        size = os.path.getsize(file_path)
+        if size < 1024:
+            logger.error(f"ytdlp: file too small {size}B")
+            return None, title or "YouTube Audio", duration
+        logger.info(f"ytdlp downloaded {size // 1024}KB: {title}")
+        return file_path, title or "YouTube Audio", duration
+    except Exception as e:
+        logger.error(f"ytdlp_download error: {e}")
+        # تنظيف الملفات المؤقتة عند الفشل
+        try:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        return None, title or "", duration
+
+
 # ─── Fallback: بحث + تحميل من المصادر الاحتياطية ─────────────────────────────
 
 async def _fallback_search_download(
@@ -670,9 +723,19 @@ async def _download_and_send_yt(
     context: ContextTypes.DEFAULT_TYPE,
     cache_key: str = "",
 ) -> bool:
-    """يأخذ رابط يوتيوب → يحمّله عبر savemp3.net → يرسله. يرجع True إذا نجح."""
+    """يأخذ رابط يوتيوب → يحمّله عبر yt-dlp ثم savemp3 احتياطياً → يرسله. يرجع True إذا نجح."""
     loop = asyncio.get_event_loop()
-    file_path, title, duration_sec = await loop.run_in_executor(None, savemp3_full_download, yt_url)
+
+    # yt-dlp أولاً
+    file_path, title, duration_sec = await loop.run_in_executor(None, ytdlp_download, yt_url)
+
+    # savemp3 احتياطياً
+    if not file_path or not os.path.exists(file_path):
+        logger.info(f"ytdlp failed for {yt_url}, trying savemp3")
+        file_path, title, duration_sec = await loop.run_in_executor(
+            None, savemp3_full_download, yt_url
+        )
+
     if not file_path or not os.path.exists(file_path):
         return False
     try:
@@ -704,21 +767,39 @@ async def _download_and_send_yt_cb(
     context: ContextTypes.DEFAULT_TYPE,
     cache_key: str = "",
 ) -> None:
-    """نفس _download_and_send_yt لكن يستخدم callback_query بدل wait_msg."""
+    """يحمّل YouTube ويرسله — يجرب yt-dlp أولاً ثم savemp3 احتياطياً."""
     loop = asyncio.get_event_loop()
-    await cb.edit_message_text("⏳ جاري التحويل والتحميل...")
-    file_path, title, duration_sec = await loop.run_in_executor(None, savemp3_full_download, yt_url)
+    await cb.edit_message_text("⏳ جاري التحميل...")
+
+    # ── 1: yt-dlp (الأسرع والأكثر موثوقية) ─────────────────────────
+    file_path, title, duration_sec = await loop.run_in_executor(None, ytdlp_download, yt_url)
+
+    # ── 2: savemp3 احتياطياً إذا فشل yt-dlp ─────────────────────────
+    if not file_path or not os.path.exists(file_path):
+        logger.info(f"ytdlp failed for {yt_url}, falling back to savemp3")
+        await cb.edit_message_text("⏳ جاري التحويل (مصدر احتياطي)...")
+        file_path, title, duration_sec = await loop.run_in_executor(
+            None, savemp3_full_download, yt_url
+        )
+
     if not file_path or not os.path.exists(file_path):
         await cb.edit_message_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
         return
+
     try:
         size_mb = os.path.getsize(file_path) / (1024 * 1024)
         if size_mb > 50:
-            await cb.edit_message_text(f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB.")
+            await cb.edit_message_text(
+                f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
+            )
             return
         artist, song_title = split_artist_title(title)
-        ok, file_id = await send_audio_file(context.bot, chat_id, file_path,
-            title=song_title or title, duration_str=fmt_sec(duration_sec), performer=artist)
+        ok, file_id = await send_audio_file(
+            context.bot, chat_id, file_path,
+            title=song_title or title,
+            duration_str=fmt_sec(duration_sec),
+            performer=artist,
+        )
         if ok:
             if cache_key and file_id:
                 cache_set(cache_key, file_id)
@@ -727,8 +808,10 @@ async def _download_and_send_yt_cb(
             await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
     finally:
         if file_path and os.path.exists(file_path):
-            try: os.unlink(file_path)
-            except Exception: pass
+            try:
+                os.unlink(file_path)
+            except Exception:
+                pass
 
 
 # ─── Shared send helper ────────────────────────────────────────────────────────
