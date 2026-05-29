@@ -577,16 +577,58 @@ async def _fallback_search_download(
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """يبحث في sm3ha → YouTube ثم يحمّل عبر savemp3."""
+    """
+    fallback لما يفشل التحميل الأساسي.
+    يجرب بالترتيب: sm3ha+savemp3 → youtube+savemp3 → nogomistars → خطأ
+    """
     loop = asyncio.get_event_loop()
-    await wait_msg.edit_text(f"🔄 جاري البحث عن: *{query}*...", parse_mode="Markdown")
+
+    # ── 1: sm3ha → savemp3 ──────────────────────────────────────────
+    await wait_msg.edit_text("🔄 جاري البحث في مصدر آخر...")
     yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
-    if not yt_url:
-        yt_url = await loop.run_in_executor(None, youtube_search_first, query)
-    if not yt_url:
-        await wait_msg.edit_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
-        return
-    await _download_and_send_yt(yt_url, wait_msg, chat_id, context)
+    if yt_url:
+        ok = await _download_and_send_yt(yt_url, wait_msg, chat_id, context, cache_key=query)
+        if ok:
+            return
+
+    # ── 2: YouTube مباشر → savemp3 ──────────────────────────────────
+    yt_url2 = await loop.run_in_executor(None, youtube_search_first, query)
+    if yt_url2 and yt_url2 != yt_url:
+        ok = await _download_and_send_yt(yt_url2, wait_msg, chat_id, context, cache_key=query)
+        if ok:
+            return
+
+    # ── 3: nogomistars ───────────────────────────────────────────────
+    await wait_msg.edit_text("🔄 جاري البحث في نوقومي ستارز...")
+    nogomi_res = await loop.run_in_executor(None, nogomistars_search, query)
+    if nogomi_res:
+        track = nogomi_res[0]
+        await wait_msg.edit_text(f"📥 جاري التحميل...\n🎵 *{track['title']}*", parse_mode="Markdown")
+        file_path, dl_title, _ = await loop.run_in_executor(
+            None, nogomistars_download, track["dl_url"], track["title"])
+        if file_path and os.path.exists(file_path):
+            try:
+                artist, song_title = split_artist_title(dl_title)
+                ok2, file_id = await send_audio_file(context.bot, chat_id, file_path,
+                    title=song_title or dl_title, duration_str="", performer=artist)
+                if ok2:
+                    if file_id: cache_set(query, file_id)
+                    await wait_msg.delete()
+                else:
+                    await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
+                return
+            finally:
+                if os.path.exists(file_path):
+                    try: os.unlink(file_path)
+                    except Exception: pass
+        yt_id3 = track.get("yt_id")
+        if yt_id3:
+            ok = await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id3}",
+                wait_msg, chat_id, context, cache_key=query)
+            if ok:
+                return
+
+    await wait_msg.edit_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
 
 
 # ─── YouTube fallback: download & send ────────────────────────────────────────
