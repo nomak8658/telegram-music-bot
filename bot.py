@@ -90,7 +90,6 @@ def cache_set(query: str, file_id: str) -> None:
 _load_audio_cache()
 
 # كلمات النايتكور/المسرع للفلترة
-_NIGHTCORE_WORDS = {"nightcore", "sped up", "sped-up", "speed up", "spedup", "slowed", "نايتكور", "مسرع", "مبطأ"}
 
 YOUTUBE_REGEX = re.compile(
     r"(?:https?://)?(?:www\.)?(?:youtube\.com/watch\?(?:.*&)?v=|youtu\.be/)[\w\-]{11}"
@@ -447,7 +446,7 @@ def _savemp3_action(action_hash: str, payload: list) -> str:
             "Next-Router-State-Tree": _SAVEMP3_ROUTER_STATE,
             "Accept": "text/x-component,*/*",
         },
-        timeout=60,
+        timeout=20,
     )
     r.encoding = "utf-8"
     return r.text
@@ -506,8 +505,8 @@ def savemp3_full_download(yt_url: str) -> tuple[str | None, str, int]:
 
     task_id = d2["taskId"]
 
-    # Poll status
-    deadline = time.time() + 180
+    # Poll status — max 45 ثانية
+    deadline = time.time() + 45
     download_url = None
     while time.time() < deadline:
         try:
@@ -523,17 +522,17 @@ def savemp3_full_download(yt_url: str) -> tuple[str | None, str, int]:
                     return None, title, duration
         except Exception as e:
             logger.error(f"savemp3_poll error: {e}")
-        time.sleep(2)
+        time.sleep(3)
 
     if not download_url:
         return None, title, duration
 
-    # Download file
+    # Download file — max 40 ثانية
     try:
         resp = requests.get(
             download_url,
             headers={"User-Agent": SAVEMP3_HEADERS["User-Agent"]},
-            stream=True, timeout=120, allow_redirects=True,
+            stream=True, timeout=40, allow_redirects=True,
         )
         resp.raise_for_status()
         tmp = tempfile.NamedTemporaryFile(
@@ -695,14 +694,11 @@ async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE
         f"🎵 جاري البحث والتحميل: *{query}*...", parse_mode="Markdown")
     loop = asyncio.get_event_loop()
 
-    # ── 1: sm3ha.io → savemp3.net (يجرب أكثر من نتيجة) ─────────────
+    # ── 1: sm3ha.io → savemp3.net (أول نتيجتين بدون فلتر) ──────────
     sm3ha_results = await loop.run_in_executor(None, sm3ha_search_all, query)
-    # فلتر النايتكور/المسرع — نفضّل النظيف أولاً، ثم الباقي fallback
-    clean   = [r for r in sm3ha_results if not any(w in r["title"].lower() for w in _NIGHTCORE_WORDS)]
-    ordered = clean + [r for r in sm3ha_results if r not in clean]
-    for r in ordered[:4]:                     # أقصى 4 محاولات من sm3ha
+    for r in sm3ha_results[:2]:               # أقصى محاولتين
         yt_id = r["yt_id"]
-        await wait_msg.edit_text(f"⏳ جاري التحويل والتحميل...")
+        await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
         ok = await _download_and_send_yt(
             f"https://www.youtube.com/watch?v={yt_id}",
             wait_msg, msg.chat_id, context, cache_key=query)
@@ -804,9 +800,9 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 1: sm3ha.io → 2: savemp3.net ────────────────────────────────
     sm3ha_res = await loop.run_in_executor(None, sm3ha_search_all, query)
-    clean = [r for r in sm3ha_res if not any(w in r["title"].lower() for w in _NIGHTCORE_WORDS)]
-    yt_id = clean[0]["yt_id"] if clean else (sm3ha_res[0]["yt_id"] if sm3ha_res else None)
+    yt_id = sm3ha_res[0]["yt_id"] if sm3ha_res else None
     if yt_id:
+        await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
         await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id}",
             wait_msg, msg.chat_id, context, cache_key=query)
         return
