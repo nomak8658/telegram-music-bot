@@ -221,6 +221,28 @@ def sm3ha_search_first(query: str) -> str | None:
     return None
 
 
+def sm3ha_search_all(query: str) -> list:
+    """يبحث في sm3ha.io ويرجع قائمة نتائج مع العناوين."""
+    try:
+        slug = query.replace(" ", "-")
+        url  = f"https://v1.sm3ha.io/s/{slug}"
+        r    = requests.get(url, headers=YT_SEARCH_HEADERS, timeout=15)
+        vids = re.findall(r'href="#([A-Za-z0-9_-]{11})"', r.text)
+        # استخراج العناوين من الـ HTML
+        titles = re.findall(r'<h\d[^>]*>\s*([^<]{3,80}?)\s*</h\d>', r.text)
+        if not titles:
+            titles = re.findall(r'title="([^"]{3,80})"', r.text)
+        results = []
+        for i, vid in enumerate(vids[:8]):
+            title = titles[i].strip() if i < len(titles) else f"{query} — نتيجة {i+1}"
+            results.append({"title": title, "yt_id": vid, "source": "sm3ha"})
+        logger.info(f"sm3ha_search_all found {len(results)} for: {query}")
+        return results
+    except Exception as e:
+        logger.error(f"sm3ha_search_all error: {e}")
+        return []
+
+
 def youtube_search_first(query: str) -> str | None:
     """يبحث في يوتيوب ويرجع رابط أول فيديو، أو None."""
     try:
@@ -537,6 +559,35 @@ async def _download_and_send_yt(
                 os.unlink(file_path)
             except Exception:
                 pass
+
+
+async def _download_and_send_yt_cb(
+    yt_url: str,
+    cb,
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """نفس _download_and_send_yt لكن يستخدم callback_query بدل wait_msg."""
+    loop = asyncio.get_event_loop()
+    await cb.edit_message_text("⏳ جاري التحويل والتحميل...")
+    file_path, title, duration_sec = await loop.run_in_executor(None, savemp3_full_download, yt_url)
+    if not file_path or not os.path.exists(file_path):
+        await cb.edit_message_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
+        return
+    try:
+        size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        if size_mb > 50:
+            await cb.edit_message_text(f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB.")
+            return
+        artist, song_title = split_artist_title(title)
+        sent = await send_audio_file(context.bot, chat_id, file_path,
+            title=song_title or title, duration_str=fmt_sec(duration_sec), performer=artist)
+        if sent: await cb.delete_message()
+        else: await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
+    finally:
+        if file_path and os.path.exists(file_path):
+            try: os.unlink(file_path)
+            except Exception: pass
 
 
 # ─── Shared send helper ────────────────────────────────────────────────────────
@@ -875,41 +926,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(label, callback_data=f"dl_{i}")])
         return keyboard
 
-    # ── 1: mp3j.cc ──────────────────────────────────────────────────
-    results = await loop.run_in_executor(None, mp3j_search, query)
-    if results:
-        for r in results:
-            r["source"] = "mp3j"
-        user_search_results[user_id] = results
-        await wait_msg.edit_text(
-            f"🎶 نتائج لـ *{query}* — اختار الأغنية:",
-            reply_markup=InlineKeyboardMarkup(_make_keyboard(results)),
-            parse_mode="Markdown",
-        )
+    # ── ابحث في كل المصادر بالتوازي ────────────────────────────────
+    mp3j_res, sm3ha_res, nogomi_res = await asyncio.gather(
+        loop.run_in_executor(None, mp3j_search, query),
+        loop.run_in_executor(None, sm3ha_search_all, query),
+        loop.run_in_executor(None, nogomistars_search, query),
+    )
+
+    # ── رتّب: mp3j أول، sm3ha ثاني، nogomistars أخير ──────────────
+    combined = []
+    for r in mp3j_res:
+        r["source"] = "mp3j"
+        combined.append(r)
+    for r in sm3ha_res:
+        combined.append(r)
+    for r in nogomi_res:
+        combined.append(r)
+
+    if not combined:
+        await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
         return
 
-    # ── 2: sm3ha.io → 3: savemp3.net (تحميل مباشر لأول نتيجة) ─────
-    yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
-    if yt_url:
-        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
-        return
-
-    # ── 4: nogomistars.com ──────────────────────────────────────────
-    nogomi_results = await loop.run_in_executor(None, nogomistars_search, query)
-    if nogomi_results:
-        user_search_results[user_id] = nogomi_results
-        keyboard = []
-        for i, r in enumerate(nogomi_results):
-            label = f"🎵 {r['title'][:50]}"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"dl_{i}")])
-        await wait_msg.edit_text(
-            f"🎶 نتائج لـ *{query}* — اختار الأغنية:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown",
-        )
-        return
-
-    await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
+    user_search_results[user_id] = combined
+    await wait_msg.edit_text(
+        f"🎶 نتائج لـ *{query}* — اختار الأغنية:",
+        reply_markup=InlineKeyboardMarkup(_make_keyboard(combined)),
+        parse_mode="Markdown",
+    )
 
 
 async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -938,6 +981,13 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     loop = asyncio.get_event_loop()
+
+    # ── sm3ha.io: تحميل عبر savemp3 ────────────────────────────────
+    if source == "sm3ha":
+        yt_id  = track.get("yt_id", "")
+        yt_url = f"https://www.youtube.com/watch?v={yt_id}"
+        await _download_and_send_yt_cb(yt_url, cb, update.effective_chat.id, context)
+        return
 
     # ── nogomistars.com: تحميل مباشر ───────────────────────────────
     if source == "nogomi":
