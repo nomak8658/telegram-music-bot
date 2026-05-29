@@ -744,7 +744,7 @@ async def send_cached(bot, chat_id: int, file_id: str, title: str, duration_str:
 
 async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     """يوت + اسم أغنية: يجيب أول نتيجة ويحمّلها فوراً.
-    الترتيب: sm3ha.io → mp3j.cc → savemp3.net → nogomistars.com
+    الترتيب: mp3j.cc → sm3ha.io → nogomistars.com
     """
     # ── كاش: إذا سبق وشُغّلت هذي الأغنية تجي بثانية ───────────────
     cached_fid = cache_get(query)
@@ -801,7 +801,7 @@ async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE
         if ok:
             return
 
-    # ── 4: nogomistars.com ──────────────────────────────────────────
+    # ── 3: nogomistars.com ──────────────────────────────────────────
     nogomi_results = await loop.run_in_executor(None, nogomistars_search, query)
     if nogomi_results:
         track = nogomi_results[0]
