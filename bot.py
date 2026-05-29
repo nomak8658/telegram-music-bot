@@ -137,23 +137,30 @@ def nogomistars_search(query: str) -> list:
             return []
         url = f"https://{subdomain}.nogomistars.com/"
         r = requests.get(url, headers=YT_SEARCH_HEADERS, timeout=15, allow_redirects=True)
-        final = r.url.replace("https://", "").replace("http://", "").rstrip("/")
-        if final in ("nogomistars.com", "www.nogomistars.com"):
+        # تحقق من عدم الانتقال للصفحة الرئيسية
+        final = r.url.replace("https://", "").replace("http://", "").split("/")[0]
+        if subdomain not in final:
+            logger.info(f"nogomistars: no results for '{query}' (redirected to {final})")
             return []
-        pattern = (
-            r'href="(https://[^"]+/d/[^"]+)"[^>]*>'
-            r'.*?<img[^>]+src="https://i\.ytimg\.com/vi/([\w\-]{11})/[^"]*"'
-            r'[^>]*alt="([^"]*)"'
+        # استخرج بيانات كل بطاقة منفصلة
+        dl_urls = re.findall(r'href="(https://[^"]+/d/[^"]+)"', r.text)
+        yt_ids  = re.findall(r'ytimg\.com/vi/([\w\-]{11})/', r.text)
+        # استخرج كل نصوص alt (فقط من ytimg thumbnails)
+        raw_titles = re.findall(
+            r'ytimg\.com/vi/[\w\-]{11}/[^"]*"[^>]*alt="([^"]*)"', r.text
         )
-        cards = re.findall(pattern, r.text, re.DOTALL)
         results = []
-        for dl_url, yt_id, raw_title in cards[:8]:
-            title = re.sub(r"\s*نجومي\s*$", "", raw_title.strip()).strip()
+        count = min(len(dl_urls), len(yt_ids), 8)
+        for i in range(count):
+            raw = raw_titles[i] if i < len(raw_titles) else ""
+            title = re.sub(r"\s*نجومي\s*$", "", raw.strip()).strip()
             title = re.sub(r"\s+", " ", title)
+            if not title:
+                title = f"أغنية {i + 1}"
             results.append({
                 "title": title,
-                "dl_url": dl_url,
-                "yt_id": yt_id,
+                "dl_url": dl_urls[i],
+                "yt_id": yt_ids[i],
                 "source": "nogomi",
             })
         logger.info(f"nogomistars found {len(results)} for: {query}")
@@ -183,8 +190,9 @@ def nogomistars_download(dl_url: str, title: str) -> tuple[str | None, str, int]
                     if chunk:
                         f.write(chunk)
             size = os.path.getsize(path)
-            if size < 65536:
+            if size < 1024:  # أقل من 1KB = ملف فاشل
                 os.unlink(path)
+                logger.warning(f"nogomistars_download: file too small ({size}B)")
                 return None, title, 0
             logger.info(f"nogomistars downloaded {size//1024}KB: {title}")
             return path, title, 0
@@ -718,11 +726,50 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
 
     # ── المصدر الثاني: sm3ha.io → savemp3.net ──────────────────────
     yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
-    if not yt_url:
-        await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
+    if yt_url:
+        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
         return
 
-    await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
+    # ── المصدر الثالث: mp3j.cc (أول نتيجة) ────────────────────────
+    mp3j_results = await loop.run_in_executor(None, mp3j_search, query)
+    if mp3j_results:
+        track    = mp3j_results[0]
+        track_id = track["id"]
+        title_mp = track["title"]
+        query_q  = track["query"]
+        artist, song_title = split_artist_title(title_mp)
+        await wait_msg.edit_text(
+            f"⏳ جاري التحضير...\n🎵 *{title_mp}*",
+            parse_mode="Markdown",
+        )
+        ok = await mp3j_prepare(track_id, query_q)
+        if ok:
+            await wait_msg.edit_text(
+                f"📥 جاري التحميل...\n🎵 *{title_mp}*",
+                parse_mode="Markdown",
+            )
+            file_path = await loop.run_in_executor(None, mp3j_download, track_id, query_q, title_mp)
+            if file_path and os.path.exists(file_path):
+                try:
+                    sent = await send_audio_file(
+                        context.bot, msg.chat_id, file_path,
+                        title=song_title or title_mp,
+                        duration_str=track["duration"],
+                        performer=artist,
+                    )
+                    if sent:
+                        await wait_msg.delete()
+                    else:
+                        await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
+                    return
+                finally:
+                    if os.path.exists(file_path):
+                        try:
+                            os.unlink(file_path)
+                        except Exception:
+                            pass
+
+    await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
 
 
 # ─── Telegram Handlers ────────────────────────────────────────────────────────
@@ -892,7 +939,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── المصدر الثاني: mp3j.cc (SoundCloud) ─────────────────────────
+    # ── المصدر الثاني: sm3ha.io (تحميل مباشر لأول نتيجة) ──────────
+    yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
+    if yt_url:
+        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
+        return
+
+    # ── المصدر الثالث: mp3j.cc (SoundCloud) ─────────────────────────
     results = await loop.run_in_executor(None, mp3j_search, query)
     if results:
         for r in results:
@@ -903,12 +956,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(_make_keyboard(results)),
             parse_mode="Markdown",
         )
-        return
-
-    # ── المصدر الثالث: sm3ha.io (تحميل مباشر لأول نتيجة) ──────────
-    yt_url = await loop.run_in_executor(None, sm3ha_search_first, query)
-    if yt_url:
-        await _download_and_send_yt(yt_url, wait_msg, msg.chat_id, context)
         return
 
     await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
