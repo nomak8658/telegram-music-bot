@@ -694,18 +694,7 @@ async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE
         f"🎵 جاري البحث والتحميل: *{query}*...", parse_mode="Markdown")
     loop = asyncio.get_event_loop()
 
-    # ── 1: sm3ha.io → savemp3.net (أول نتيجتين بدون فلتر) ──────────
-    sm3ha_results = await loop.run_in_executor(None, sm3ha_search_all, query)
-    for r in sm3ha_results[:2]:               # أقصى محاولتين
-        yt_id = r["yt_id"]
-        await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
-        ok = await _download_and_send_yt(
-            f"https://www.youtube.com/watch?v={yt_id}",
-            wait_msg, msg.chat_id, context, cache_key=query)
-        if ok:
-            return
-
-    # ── 3: mp3j.cc ──────────────────────────────────────────────────
+    # ── 1: mp3j.cc ──────────────────────────────────────────────────
     results = await loop.run_in_executor(None, mp3j_search, query)
     if results:
         track    = results[0]
@@ -737,6 +726,17 @@ async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE
                     if file_path and os.path.exists(file_path):
                         try: os.unlink(file_path)
                         except Exception: pass
+
+    # ── 2: sm3ha.io → savemp3.net ────────────────────────────────────
+    sm3ha_results = await loop.run_in_executor(None, sm3ha_search_all, query)
+    for r in sm3ha_results[:2]:
+        yt_id = r["yt_id"]
+        await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
+        ok = await _download_and_send_yt(
+            f"https://www.youtube.com/watch?v={yt_id}",
+            wait_msg, msg.chat_id, context, cache_key=query)
+        if ok:
+            return
 
     # ── 4: nogomistars.com ──────────────────────────────────────────
     nogomi_results = await loop.run_in_executor(None, nogomistars_search, query)
@@ -798,16 +798,7 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     wait_msg = await msg.reply_text(f"🔍 جاري البحث عن: *{query}*...", parse_mode="Markdown")
     loop = asyncio.get_event_loop()
 
-    # ── 1: sm3ha.io → 2: savemp3.net ────────────────────────────────
-    sm3ha_res = await loop.run_in_executor(None, sm3ha_search_all, query)
-    yt_id = sm3ha_res[0]["yt_id"] if sm3ha_res else None
-    if yt_id:
-        await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
-        await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id}",
-            wait_msg, msg.chat_id, context, cache_key=query)
-        return
-
-    # ── 3: mp3j.cc ──────────────────────────────────────────────────
+    # ── 1: mp3j.cc ──────────────────────────────────────────────────
     mp3j_results = await loop.run_in_executor(None, mp3j_search, query)
     if mp3j_results:
         track    = mp3j_results[0]
@@ -834,6 +825,15 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
                     if os.path.exists(file_path):
                         try: os.unlink(file_path)
                         except Exception: pass
+
+    # ── 2: sm3ha.io → savemp3.net ────────────────────────────────────
+    sm3ha_res = await loop.run_in_executor(None, sm3ha_search_all, query)
+    yt_id = sm3ha_res[0]["yt_id"] if sm3ha_res else None
+    if yt_id:
+        await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
+        await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id}",
+            wait_msg, msg.chat_id, context, cache_key=query)
+        return
 
     # ── 4: nogomistars.com ──────────────────────────────────────────
     nogomi_results = await loop.run_in_executor(None, nogomistars_search, query)
@@ -1025,12 +1025,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop.run_in_executor(None, nogomistars_search, query),
     )
 
-    # ── رتّب: sm3ha أول، mp3j ثاني، nogomistars أخير — بحد أقصى 10 ──
+    # ── رتّب: mp3j أول، sm3ha ثاني، nogomistars أخير — بحد أقصى 10 ──
     combined = []
-    for r in sm3ha_res:
-        combined.append(r)
     for r in mp3j_res:
         r["source"] = "mp3j"
+        combined.append(r)
+    for r in sm3ha_res:
         combined.append(r)
     for r in nogomi_res:
         combined.append(r)
