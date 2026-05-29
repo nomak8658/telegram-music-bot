@@ -842,11 +842,12 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     yt_id = sm3ha_res[0]["yt_id"] if sm3ha_res else None
     if yt_id:
         await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
-        await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id}",
+        ok = await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id}",
             wait_msg, msg.chat_id, context, cache_key=query)
-        return
+        if ok:
+            return
 
-    # ── 4: nogomistars.com ──────────────────────────────────────────
+    # ── 3: nogomistars.com ───────────────────────────────────────────
     nogomi_results = await loop.run_in_executor(None, nogomistars_search, query)
     if nogomi_results:
         track = nogomi_results[0]
@@ -870,9 +871,10 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
                     except Exception: pass
         yt_id2 = track.get("yt_id")
         if yt_id2:
-            await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id2}",
+            ok = await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id2}",
                 wait_msg, msg.chat_id, context, cache_key=query)
-            return
+            if ok:
+                return
 
     await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
 
