@@ -32,11 +32,22 @@ OWNER_ID = 864463823          # المالك الوحيد اللي يقدر يض
 GROUPS_FILE = "allowed_groups.json"
 
 def _load_groups() -> set[int]:
+    groups: set[int] = set()
+    # من متغير البيئة ALLOWED_GROUPS (مفصولة بفاصلة)
+    env_val = os.environ.get("ALLOWED_GROUPS", "")
+    for part in env_val.split(","):
+        part = part.strip()
+        if part:
+            try: groups.add(int(part))
+            except ValueError: pass
+    # من ملف JSON (للقروبات المضافة يدوياً بـ /allow)
     try:
         with open(GROUPS_FILE) as f:
-            return set(json.load(f))
+            for gid in json.load(f):
+                groups.add(int(gid))
     except Exception:
-        return set()
+        pass
+    return groups
 
 def _save_groups(groups: set[int]) -> None:
     with open(GROUPS_FILE, "w") as f:
@@ -1025,12 +1036,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop.run_in_executor(None, nogomistars_search, query),
     )
 
-    # ── رتّب: mp3j أول، sm3ha ثاني، nogomistars أخير — بحد أقصى 10 ──
+    # ── رتّب: mp3j أول، nogomistars ثاني — sm3ha محذوف (بدون عناوين حقيقية) ──
     combined = []
     for r in mp3j_res:
         r["source"] = "mp3j"
-        combined.append(r)
-    for r in sm3ha_res:
         combined.append(r)
     for r in nogomi_res:
         combined.append(r)
