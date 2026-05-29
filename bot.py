@@ -9,6 +9,7 @@ from datetime import datetime
 
 import requests
 import websockets
+import yt_dlp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -133,16 +134,52 @@ def nogomistars_search(query: str) -> list:
         url = f"https://{subdomain}.nogomistars.com/"
         r = requests.get(url, headers=YT_SEARCH_HEADERS, timeout=15)
         r.raise_for_status()
-        # استخراج كل song-card: YouTube ID من الـ thumbnail + العنوان من alt
-        cards = re.findall(
-            r'<a[^>]+class="song-card"[^>]*>.*?'
-            r'<img[^>]+src="https://i\.ytimg\.com/vi/([\w\-]{11})/[^"]*"[^>]*alt="([^"]*)"',
-            r.text, re.DOTALL
-        )
+
+        # استخراج كل YouTube IDs من روابط الـ thumbnails
+        all_yt_ids = re.findall(r'i\.ytimg\.com/vi/([\w\-]{11})/', r.text)
+        seen: set[str] = set()
+        unique_ids = []
+        for vid in all_yt_ids:
+            if vid not in seen:
+                seen.add(vid)
+                unique_ids.append(vid)
+
         results = []
-        for yt_id, alt_text in cards[:10]:
-            title = alt_text.replace(" نجومي", "").strip()
+        for yt_id in unique_ids[:10]:
+            # ابحث عن الـ img tag الخاصة بهذا الـ ID واستخرج alt منها
+            img_match = re.search(
+                rf'<img[^>]+(?:src|data-src)="[^"]*{re.escape(yt_id)}[^"]*"([^>]*)>',
+                r.text,
+            )
+            title = ""
+            if img_match:
+                attrs = img_match.group(1)
+                alt_m = re.search(r'alt="([^"]*)"', attrs)
+                if alt_m:
+                    title = alt_m.group(1)
+                # إذا alt قبل src جرّب من الـ tag كاملة
+                if not title:
+                    full_tag = img_match.group(0)
+                    alt_m2 = re.search(r'alt="([^"]*)"', full_tag)
+                    if alt_m2:
+                        title = alt_m2.group(1)
+
+            # fallback: ابحث في السياق المحيط بالـ ID
+            if not title:
+                pos = r.text.find(yt_id)
+                if pos != -1:
+                    ctx = r.text[max(0, pos - 300):pos + 300]
+                    for pattern in [r'alt="([^"]{3,})"', r'title="([^"]{3,})"', r'<h\d[^>]*>([^<]{3,})<']:
+                        m = re.search(pattern, ctx)
+                        if m:
+                            title = m.group(1)
+                            break
+
+            title = title.replace(" نجومي", "").strip()
             title = re.sub(r"\s+", " ", title).strip()
+            if not title:
+                title = f"أغنية {len(results) + 1}"
+
             results.append({
                 "source": "nogomi",
                 "yt_id": yt_id,
@@ -277,6 +314,39 @@ def mp3j_download(track_id: str, query: str, title: str) -> str | None:
     except Exception as e:
         logger.error(f"Download error: {e}")
         return None
+
+
+# ─── yt-dlp download ──────────────────────────────────────────────────────────
+
+def ytdlp_download(yt_url: str) -> tuple[str | None, str, int]:
+    """
+    يحمّل صوت يوتيوب بـ yt-dlp بدون حاجة لـ ffmpeg (m4a/webm مباشر).
+    يرجع (مسار الملف, العنوان, المدة بالثواني) أو (None, '', 0).
+    """
+    try:
+        tmp_dir = tempfile.mkdtemp()
+        ydl_opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio",
+            "outtmpl": os.path.join(tmp_dir, "%(title)s.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "socket_timeout": 30,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(yt_url, download=True)
+            title = info.get("title", "YouTube Audio") if info else "YouTube Audio"
+            duration = int(info.get("duration", 0)) if info else 0
+
+        # ابحث عن الملف المحمّل
+        for fname in os.listdir(tmp_dir):
+            fpath = os.path.join(tmp_dir, fname)
+            if os.path.isfile(fpath):
+                return fpath, title, duration
+        return None, title, duration
+    except Exception as e:
+        logger.error(f"ytdlp_download error: {e}")
+        return None, "", 0
 
 
 # ─── ar.savemp3.net API ───────────────────────────────────────────────────────
@@ -450,11 +520,18 @@ async def _download_and_send_yt(
     """
     loop = asyncio.get_event_loop()
 
-    await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
+    await wait_msg.edit_text("⏳ جاري التحميل...")
 
+    # yt-dlp أولاً — الأسرع والأموثوق
     file_path, title, duration_sec = await loop.run_in_executor(
-        None, savemp3_full_download, yt_url
+        None, ytdlp_download, yt_url
     )
+    # احتياط: savemp3.net إذا فشل yt-dlp
+    if not file_path or not os.path.exists(file_path):
+        await wait_msg.edit_text("⏳ جاري التحويل...")
+        file_path, title, duration_sec = await loop.run_in_executor(
+            None, savemp3_full_download, yt_url
+        )
 
     if not file_path or not os.path.exists(file_path):
         await wait_msg.edit_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
