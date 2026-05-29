@@ -354,12 +354,14 @@ def mp3j_search(query: str) -> list:
         logger.error(f"Search error: {e}")
         return []
 
-    logger.info(f"mp3j API keys: {list(data.keys())}")
+    sc = data.get("SoundCloud", []) or []
+    yt = data.get("YoutubeSearch", []) or []
+    logger.info(f"mp3j search '{query}': SC={len(sc)} YT={len(yt)}")
 
     results = []
 
-    # ── SoundCloud ─────────────────────────────────────────────────
-    for track in data.get("SoundCloud", [])[:6]:
+    # ── SoundCloud (تحميل سريع عبر WebSocket) ──────────────────────
+    for track in sc[:6]:
         track_id = track.get("id")
         if not track_id:
             continue
@@ -377,22 +379,16 @@ def mp3j_search(query: str) -> list:
             "source": "mp3j",
         })
 
-    # ── YouTube ────────────────────────────────────────────────────
-    for track in data.get("YouTube", [])[:6]:
-        yt_id = track.get("id") or track.get("videoId") or track.get("video_id")
+    # ── YoutubeSearch (أسماء حقيقية، تحميل عبر savemp3) ────────────
+    for track in yt[:8]:
+        yt_id = track.get("id")
         if not yt_id:
             continue
-        title = track.get("title") or track.get("name") or "بدون عنوان"
-        raw_dur = track.get("duration", 0)
-        # mp3j قد يرجع المدة بالثواني أو الميللي-ثانية
-        if isinstance(raw_dur, int) and raw_dur > 7200:
-            duration = fmt_duration(raw_dur)   # milliseconds
-        else:
-            duration = fmt_sec(int(raw_dur))   # seconds
+        title = track.get("title") or "بدون عنوان"
         results.append({
             "id": str(yt_id),
             "title": title,
-            "duration": duration,
+            "duration": "",
             "yt_id": str(yt_id),
             "query": query,
             "source": "mp3j_yt",
@@ -482,12 +478,8 @@ _SAVEMP3_ROUTER_STATE = (
 )
 
 
-def _savemp3_action(action_hash: str, payload: list) -> str:
-    # زيارة الصفحة أولاً لأخذ الـ cookies المطلوبة
-    s = requests.Session()
-    s.headers.update({"User-Agent": SAVEMP3_HEADERS["User-Agent"]})
-    s.get(SAVEMP3_BASE + SAVEMP3_PATH, timeout=15)
-    r = s.post(
+def _savemp3_action(session: requests.Session, action_hash: str, payload: list) -> str:
+    r = session.post(
         SAVEMP3_BASE + SAVEMP3_PATH,
         data=json.dumps(payload),
         headers={
@@ -518,8 +510,17 @@ def savemp3_full_download(yt_url: str) -> tuple[str | None, str, int]:
     يشغّل كل مراحل savemp3.net.
     يرجع (مسار الملف, العنوان, المدة بالثواني) أو (None, '', 0).
     """
+    # session واحد طوال العملية — زيارة صفحة واحدة لأخذ الكوكيز
+    session = requests.Session()
+    session.headers.update({"User-Agent": SAVEMP3_HEADERS["User-Agent"]})
     try:
-        raw = _savemp3_action(SA_VIDEO_INFO, [yt_url])
+        session.get(SAVEMP3_BASE + SAVEMP3_PATH, timeout=15)
+    except Exception as e:
+        logger.error(f"savemp3 page visit error: {e}")
+        return None, "", 0
+
+    try:
+        raw = _savemp3_action(session, SA_VIDEO_INFO, [yt_url])
         info = _parse_savemp3_success(raw)
     except Exception as e:
         logger.error(f"savemp3_get_info error: {e}")
@@ -544,7 +545,7 @@ def savemp3_full_download(yt_url: str) -> tuple[str | None, str, int]:
     # Start download
     try:
         payload = [{"task": task, "length": duration, "from": 0, "to": duration}]
-        raw2 = _savemp3_action(SA_GET_DOWNLOAD, payload)
+        raw2 = _savemp3_action(session, SA_GET_DOWNLOAD, payload)
         d2 = _parse_savemp3_success(raw2)
     except Exception as e:
         logger.error(f"savemp3_start_download error: {e}")
@@ -560,7 +561,7 @@ def savemp3_full_download(yt_url: str) -> tuple[str | None, str, int]:
     download_url = None
     while time.time() < deadline:
         try:
-            raw3 = _savemp3_action(SA_GET_STATUS, [task_id])
+            raw3 = _savemp3_action(session, SA_GET_STATUS, [task_id])
             d3 = _parse_savemp3_success(raw3)
             if d3:
                 status = d3.get("status", "")
@@ -572,7 +573,7 @@ def savemp3_full_download(yt_url: str) -> tuple[str | None, str, int]:
                     return None, title, duration
         except Exception as e:
             logger.error(f"savemp3_poll error: {e}")
-        time.sleep(3)
+        time.sleep(2)
 
     if not download_url:
         return None, title, duration
@@ -1112,35 +1113,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(label, callback_data=f"dl_{i}")])
         return keyboard
 
-    # ── ابحث في كل المصادر بالتوازي ────────────────────────────────
-    mp3j_res, sm3ha_res, nogomi_res = await asyncio.gather(
+    # ── ابحث في mp3j (SoundCloud+YouTube) و nogomistars بالتوازي ───
+    mp3j_res, nogomi_res = await asyncio.gather(
         loop.run_in_executor(None, mp3j_search, query),
-        loop.run_in_executor(None, sm3ha_search_all, query),
         loop.run_in_executor(None, nogomistars_search, query),
     )
 
-    # ── رتّب: mp3j أول، sm3ha ثاني، nogomistars ثالث ───────────────
-    combined = []
-    for r in mp3j_res:
-        if not r.get("source"):
-            r["source"] = "mp3j"
-        combined.append(r)
-    for r in sm3ha_res:
-        combined.append(r)          # عناوين حقيقية لو موجودة أو "Query (N)"
-    for r in nogomi_res:
-        combined.append(r)
+    # mp3j يرجع نوعين: SoundCloud (تحميل سريع) و YouTube (أسماء حقيقية)
+    sc_res = [r for r in mp3j_res if r.get("source") == "mp3j"]
+    yt_res = [r for r in mp3j_res if r.get("source") == "mp3j_yt"]
 
-    # أزل التكرار حسب yt_id
-    seen_yt: set[str] = set()
+    # ── رتّب: SoundCloud أول (أسرع) → nogomistars → mp3j YouTube ───
+    combined = sc_res + nogomi_res + yt_res
+
+    # أزل التكرار حسب yt_id / id
+    seen: set[str] = set()
     deduped = []
     for r in combined:
-        yt = r.get("yt_id") or r.get("id")
-        if yt and yt in seen_yt:
+        key = r.get("yt_id") or r.get("id") or r.get("title")
+        if key and key in seen:
             continue
-        if yt:
-            seen_yt.add(yt)
+        if key:
+            seen.add(key)
         deduped.append(r)
-    combined = deduped[:10]          # أقصى 10 نتائج
+    combined = deduped[:12]          # أقصى 12 نتيجة
 
     if not combined:
         await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
