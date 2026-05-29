@@ -1,0 +1,7 @@
+python-telegram-bot==22.7
+requests==2.34.2
+websockets==15.0.1
+python-telegram-bot
+requests
+telegram
+websockets
