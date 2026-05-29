@@ -61,8 +61,16 @@ HEADERS = {
     "Referer": "https://mp3j.cc/ar/",
 }
 
-# { user_id: [results] }
+# { user_id: [results] } — محدود بـ 300 مستخدم لمنع memory leak
+_MAX_SEARCH_CACHE = 300
 user_search_results: dict[int, list] = {}
+
+def _store_search(user_id: int, results: list) -> None:
+    if len(user_search_results) >= _MAX_SEARCH_CACHE:
+        # احذف أقدم مستخدم
+        oldest = next(iter(user_search_results))
+        del user_search_results[oldest]
+    user_search_results[user_id] = results
 
 # Bot username — filled on startup
 BOT_USERNAME: str = ""
@@ -365,7 +373,7 @@ def mp3j_search(query: str) -> list:
 
 
 async def mp3j_prepare(track_id: str, query: str) -> bool:
-    """يتصل بـ WebSocket على cdn.mp3j.cc لتحضير ملف MP3."""
+    """يتصل بـ WebSocket على cdn.mp3j.cc لتحضير ملف MP3 — max 45 ثانية كلياً."""
     uri = (
         f"wss://cdn.mp3j.cc/WS/SoundCloud/track"
         f"?query={requests.utils.quote(query)}&id={track_id}"
@@ -374,7 +382,7 @@ async def mp3j_prepare(track_id: str, query: str) -> bool:
         "Origin": "https://mp3j.cc",
         "User-Agent": HEADERS["User-Agent"],
     }
-    try:
+    async def _inner() -> bool:
         async with websockets.connect(uri, additional_headers=ws_headers, open_timeout=20) as ws:
             async for raw in ws:
                 msg = json.loads(raw)
@@ -385,10 +393,12 @@ async def mp3j_prepare(track_id: str, query: str) -> bool:
                 if t == "error":
                     logger.error(f"WS error: {msg}")
                     return False
+        return True
+    try:
+        return await asyncio.wait_for(_inner(), timeout=45)
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         return False
-    return True
 
 
 def mp3j_download(track_id: str, query: str, title: str) -> str | None:
@@ -798,7 +808,7 @@ async def yot_youtube(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     """
     شغل [اسم الأغنية]:
-      الترتيب: sm3ha.io → mp3j.cc → savemp3.net → nogomistars.com
+      الترتيب: mp3j.cc → sm3ha.io → savemp3.net → nogomistars.com
     """
     cached_fid = cache_get(query)
     if cached_fid:
@@ -1052,7 +1062,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
         return
 
-    user_search_results[user_id] = combined
+    _store_search(user_id, combined)
     await wait_msg.edit_text(
         f"🎶 نتائج لـ *{query}* — اختار الأغنية:",
         reply_markup=InlineKeyboardMarkup(_make_keyboard(combined)),
