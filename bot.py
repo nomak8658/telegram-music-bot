@@ -317,7 +317,9 @@ def sm3ha_search_all(query: str) -> list:
 
         results = []
         for i, vid in enumerate(vids[:8]):
-            title = titles[i].strip() if i < len(titles) else ""
+            raw_title = titles[i].strip() if i < len(titles) else ""
+            # إذا ما قدرنا نستخرج العنوان نولّد اسم وصفي من الكويري
+            title = raw_title if raw_title else f"{query} ({i + 1})"
             results.append({"title": title, "yt_id": vid, "source": "sm3ha"})
 
         logger.info(f"sm3ha_search_all found {len(results)} (titles={len(titles)}) for: {query}")
@@ -600,19 +602,17 @@ async def _download_and_send_yt(
     chat_id: int,
     context: ContextTypes.DEFAULT_TYPE,
     cache_key: str = "",
-) -> None:
-    """يأخذ رابط يوتيوب → يحمّله عبر savemp3.net → يرسله ويحفظ في الكاش."""
+) -> bool:
+    """يأخذ رابط يوتيوب → يحمّله عبر savemp3.net → يرسله. يرجع True إذا نجح."""
     loop = asyncio.get_event_loop()
-    await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
     file_path, title, duration_sec = await loop.run_in_executor(None, savemp3_full_download, yt_url)
     if not file_path or not os.path.exists(file_path):
-        await wait_msg.edit_text("❌ ما قدرت أحمّل الأغنية، جرب لاحقاً.")
-        return
+        return False
     try:
         size_mb = os.path.getsize(file_path) / (1024 * 1024)
         if size_mb > 50:
             await wait_msg.edit_text(f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB.")
-            return
+            return True  # حصلنا على ملف، بس كبير — لا تحاول غيره
         artist, song_title = split_artist_title(title)
         duration_str = fmt_sec(duration_sec)
         ok, file_id = await send_audio_file(context.bot, chat_id, file_path,
@@ -623,6 +623,7 @@ async def _download_and_send_yt(
             await wait_msg.delete()
         else:
             await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
+        return ok
     finally:
         if file_path and os.path.exists(file_path):
             try: os.unlink(file_path)
@@ -719,16 +720,19 @@ async def yot_instant_search(msg, query: str, context: ContextTypes.DEFAULT_TYPE
         f"🎵 جاري البحث والتحميل: *{query}*...", parse_mode="Markdown")
     loop = asyncio.get_event_loop()
 
-    # ── 1: sm3ha.io → 2: savemp3.net ────────────────────────────────
+    # ── 1: sm3ha.io → savemp3.net (يجرب أكثر من نتيجة) ─────────────
     sm3ha_results = await loop.run_in_executor(None, sm3ha_search_all, query)
-    # فلتر النايتكور/المسرع
-    clean = [r for r in sm3ha_results if not any(w in r["title"].lower() for w in _NIGHTCORE_WORDS)]
-    yt_id = clean[0]["yt_id"] if clean else (sm3ha_results[0]["yt_id"] if sm3ha_results else None)
-    if yt_id:
-        await _download_and_send_yt(
+    # فلتر النايتكور/المسرع — نفضّل النظيف أولاً، ثم الباقي fallback
+    clean   = [r for r in sm3ha_results if not any(w in r["title"].lower() for w in _NIGHTCORE_WORDS)]
+    ordered = clean + [r for r in sm3ha_results if r not in clean]
+    for r in ordered[:4]:                     # أقصى 4 محاولات من sm3ha
+        yt_id = r["yt_id"]
+        await wait_msg.edit_text(f"⏳ جاري التحويل والتحميل...")
+        ok = await _download_and_send_yt(
             f"https://www.youtube.com/watch?v={yt_id}",
             wait_msg, msg.chat_id, context, cache_key=query)
-        return
+        if ok:
+            return
 
     # ── 3: mp3j.cc ──────────────────────────────────────────────────
     results = await loop.run_in_executor(None, mp3j_search, query)
@@ -1050,7 +1054,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop.run_in_executor(None, nogomistars_search, query),
     )
 
-    # ── رتّب: sm3ha أول، mp3j ثاني، nogomistars أخير ──────────────
+    # ── رتّب: sm3ha أول، mp3j ثاني، nogomistars أخير — بحد أقصى 10 ──
     combined = []
     for r in sm3ha_res:
         combined.append(r)
@@ -1059,6 +1063,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         combined.append(r)
     for r in nogomi_res:
         combined.append(r)
+
+    combined = combined[:10]          # أقصى 10 نتائج
 
     if not combined:
         await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
