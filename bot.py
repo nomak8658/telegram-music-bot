@@ -340,7 +340,7 @@ def youtube_search_first(query: str) -> str | None:
 # ─── mp3j.cc API ──────────────────────────────────────────────────────────────
 
 def mp3j_search(query: str) -> list:
-    """بحث في mp3j.cc ويرجع قائمة نتائج SoundCloud."""
+    """بحث في mp3j.cc ويرجع نتائج SoundCloud + YouTube."""
     try:
         resp = requests.post(
             "https://cdn.mp3j.cc/search",
@@ -354,9 +354,15 @@ def mp3j_search(query: str) -> list:
         logger.error(f"Search error: {e}")
         return []
 
+    logger.info(f"mp3j API keys: {list(data.keys())}")
+
     results = []
-    for track in data.get("SoundCloud", [])[:10]:
+
+    # ── SoundCloud ─────────────────────────────────────────────────
+    for track in data.get("SoundCloud", [])[:6]:
         track_id = track.get("id")
+        if not track_id:
+            continue
         title = track.get("title", "بدون عنوان")
         duration_ms = track.get("duration", 0)
         duration = fmt_duration(duration_ms)
@@ -368,7 +374,30 @@ def mp3j_search(query: str) -> list:
             "duration_ms": duration_ms,
             "artwork": artwork,
             "query": query,
+            "source": "mp3j",
         })
+
+    # ── YouTube ────────────────────────────────────────────────────
+    for track in data.get("YouTube", [])[:6]:
+        yt_id = track.get("id") or track.get("videoId") or track.get("video_id")
+        if not yt_id:
+            continue
+        title = track.get("title") or track.get("name") or "بدون عنوان"
+        raw_dur = track.get("duration", 0)
+        # mp3j قد يرجع المدة بالثواني أو الميللي-ثانية
+        if isinstance(raw_dur, int) and raw_dur > 7200:
+            duration = fmt_duration(raw_dur)   # milliseconds
+        else:
+            duration = fmt_sec(int(raw_dur))   # seconds
+        results.append({
+            "id": str(yt_id),
+            "title": title,
+            "duration": duration,
+            "yt_id": str(yt_id),
+            "query": query,
+            "source": "mp3j_yt",
+        })
+
     return results
 
 
@@ -1090,10 +1119,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop.run_in_executor(None, nogomistars_search, query),
     )
 
-    # ── رتّب: mp3j أول، nogomistars ثاني — sm3ha محذوف (بدون عناوين حقيقية) ──
+    # ── رتّب: mp3j (SC+YT) أول، nogomistars ثاني — sm3ha محذوف (بدون عناوين) ──
     combined = []
     for r in mp3j_res:
-        r["source"] = "mp3j"
+        if not r.get("source"):
+            r["source"] = "mp3j"
         combined.append(r)
     for r in nogomi_res:
         combined.append(r)
@@ -1160,7 +1190,14 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if source == "sm3ha":
         yt_id  = track.get("yt_id", "")
         yt_url = f"https://www.youtube.com/watch?v={yt_id}"
-        await _download_and_send_yt_cb(yt_url, cb, update.effective_chat.id, context)
+        await _download_and_send_yt_cb(yt_url, cb, update.effective_chat.id, context, cache_key=title)
+        return
+
+    # ── mp3j YouTube: تحميل عبر savemp3 ────────────────────────────
+    if source == "mp3j_yt":
+        yt_id = track.get("yt_id", "")
+        yt_url = f"https://www.youtube.com/watch?v={yt_id}"
+        await _download_and_send_yt_cb(yt_url, cb, update.effective_chat.id, context, cache_key=title)
         return
 
     # ── nogomistars.com: تحميل مباشر ───────────────────────────────
