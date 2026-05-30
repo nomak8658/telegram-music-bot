@@ -1079,14 +1079,14 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     q.append(item)
 
     if len(q) > 1:
-        await msg.reply_text(f"➕ أُضيفت للطابور (#{len(q)}): *{title}*", parse_mode="Markdown")
+        await msg.reply_text(f"**➕ أُضيفت للطابور (#{len(q)}): {title}**", parse_mode="Markdown")
         return
 
     # ── ابدأ التشغيل ──────────────────────────────────────────────────
     result = await voice_svc.join_and_play(chat_id, file_path)
     if not result["ok"]:
         err = result.get("error", "خطأ غير معروف")
-        await msg.reply_text(f"❌ فشل التشغيل:\n`{err[:300]}`", parse_mode="Markdown")
+        await msg.reply_text(f"**❌ فشل التشغيل:**\n`{err[:300]}`", parse_mode="Markdown")
         q.pop()
         if os.path.exists(file_path):
             try:
@@ -1105,7 +1105,7 @@ async def cmd_shaghl_stop(msg, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
 
     if not _vc_playing.get(chat_id) and not _vc_queue.get(chat_id):
-        await msg.reply_text("🔇 ما في شيء يشتغل الحين")
+        await msg.reply_text("**🔇 ما في شيء يشتغل الحين**", parse_mode="Markdown")
         return
 
     # امسح الطابور أولاً لمنع auto-advance
@@ -1133,32 +1133,32 @@ async def cmd_shaghl_stop(msg, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-    await msg.reply_text("تم إيقاف التشغيل ✅")
+    await msg.reply_text("**تم إيقاف التشغيل ✅**", parse_mode="Markdown")
 
 
 async def cmd_shaghl_pause(msg, context: ContextTypes.DEFAULT_TYPE):
     """وقفة — إيقاف مؤقت / استئناف."""
     chat_id = msg.chat_id
     if not _vc_playing.get(chat_id):
-        await msg.reply_text("🔇 ما في شيء يشتغل الحين")
+        await msg.reply_text("**🔇 ما في شيء يشتغل الحين**", parse_mode="Markdown")
         return
 
     paused = _vc_paused.get(chat_id, False)
     if paused:
         r = await voice_svc.resume(chat_id)
         _vc_paused[chat_id] = False
-        lbl = "▶️ كمل التشغيل"
+        lbl = "**▶️ كمل التشغيل**"
     else:
         r = await voice_svc.pause(chat_id)
         _vc_paused[chat_id] = True
-        lbl = "⏸ توقف مؤقت"
+        lbl = "**⏸ توقف مؤقت**"
 
     if r["ok"]:
         title = _vc_playing[chat_id].get("title", "")
         await _vc_send_ctrl(context.bot, chat_id, title, paused=not paused)
-        await msg.reply_text(lbl)
+        await msg.reply_text(lbl, parse_mode="Markdown")
     else:
-        await msg.reply_text(f"❌ {r.get('error', 'خطأ')}")
+        await msg.reply_text(f"**❌ {r.get('error', 'خطأ')}**", parse_mode="Markdown")
 
 
 async def cmd_shaghl_reply(msg, context: ContextTypes.DEFAULT_TYPE):
@@ -1203,13 +1203,13 @@ async def cmd_shaghl_reply(msg, context: ContextTypes.DEFAULT_TYPE):
     q.append(item)
 
     if len(q) > 1:
-        await msg.reply_text(f"➕ أُضيفت للطابور (#{len(q)}): *{title}*", parse_mode="Markdown")
+        await msg.reply_text(f"**➕ أُضيفت للطابور (#{len(q)}): {title}**", parse_mode="Markdown")
         return
 
     result = await voice_svc.join_and_play(chat_id, file_path)
     if not result["ok"]:
         err = result.get("error", "خطأ غير معروف")
-        await msg.reply_text(f"❌ فشل التشغيل:\n`{err[:300]}`", parse_mode="Markdown")
+        await msg.reply_text(f"**❌ فشل التشغيل:**\n`{err[:300]}`", parse_mode="Markdown")
         q.pop()
         if os.path.exists(file_path):
             try:
@@ -1544,11 +1544,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = _vc_queue.get(msg.chat_id, [])
         playing = _vc_playing.get(msg.chat_id)
         if not playing and not q:
-            await msg.reply_text("🔇 الطابور فاضي، ما في شيء يشتغل")
+            await msg.reply_text("**🔇 الطابور فاضي، ما في شيء يشتغل**", parse_mode="Markdown")
         else:
-            lines = ["🎶 *قائمة التشغيل*", "━━━━━━━━━━━━"]
+            lines = ["🎶 **قائمة التشغيل**", "━━━━━━━━━━━━"]
             if playing:
-                lines.append(f"▶️ *الحين:* {playing['title']}")
+                lines.append(f"▶️ **الحين:** {playing['title']}")
             for i, it in enumerate(q[1:], start=2):
                 lines.append(f"  {i}. {it['title']}")
             await msg.reply_text("\n".join(lines), parse_mode="Markdown")
