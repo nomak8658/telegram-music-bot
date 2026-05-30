@@ -426,7 +426,7 @@ async def mp3j_prepare(track_id: str, query: str) -> bool:
                     return False
         return True
     try:
-        return await asyncio.wait_for(_inner(), timeout=45)
+        return await asyncio.wait_for(_inner(), timeout=18)
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         return False
@@ -562,8 +562,8 @@ def savemp3_full_download(yt_url: str) -> tuple[str | None, str, int]:
 
     task_id = d2["taskId"]
 
-    # Poll status — max 45 ثانية
-    deadline = time.time() + 45
+    # Poll status — max 22 ثانية
+    deadline = time.time() + 22
     download_url = None
     while time.time() < deadline:
         try:
@@ -1660,15 +1660,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── يوت: فوري ──────────────────────────────────────────────────
     if is_yot:
-        if is_youtube_url(query):
-            await yot_youtube(msg, query, context)
-        else:
-            await yot_instant_search(msg, query, context)
+        try:
+            if is_youtube_url(query):
+                await asyncio.wait_for(yot_youtube(msg, query, context), timeout=75)
+            else:
+                await asyncio.wait_for(yot_instant_search(msg, query, context), timeout=75)
+        except asyncio.TimeoutError:
+            logger.warning(f"يوت timeout for query: {query}")
+            try:
+                await msg.reply_text("⌛ استغرق التحميل وقتاً طويلاً، جرب مرة ثانية.")
+            except Exception:
+                pass
         return
 
     # في الخاص: إذا أرسل رابط يوتيوب بدون أمر → تحميل مباشر
     if not is_group and is_youtube_url(query):
-        await yot_youtube(msg, query, context)
+        try:
+            await asyncio.wait_for(yot_youtube(msg, query, context), timeout=75)
+        except asyncio.TimeoutError:
+            logger.warning(f"يوت timeout for url: {query}")
+            try:
+                await msg.reply_text("⌛ استغرق التحميل وقتاً طويلاً، جرب مرة ثانية.")
+            except Exception:
+                pass
         return
 
     # ── بحث: قائمة أزرار ────────────────────────────────────────────
@@ -1769,107 +1783,116 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loop = asyncio.get_event_loop()
 
-    # ── sm3ha.io: تحميل عبر savemp3 ────────────────────────────────
-    if source == "sm3ha":
-        yt_id  = track.get("yt_id", "")
-        yt_url = f"https://www.youtube.com/watch?v={yt_id}"
-        await _download_and_send_yt_cb(yt_url, cb, update.effective_chat.id, context, cache_key=title)
-        return
+    async def _do_download():
+        # ── sm3ha.io: تحميل عبر savemp3 ────────────────────────────────
+        if source == "sm3ha":
+            yt_id  = track.get("yt_id", "")
+            yt_url = f"https://www.youtube.com/watch?v={yt_id}"
+            await _download_and_send_yt_cb(yt_url, cb, update.effective_chat.id, context, cache_key=title)
+            return
 
-    # ── mp3j YouTube: تحميل عبر savemp3 ────────────────────────────
-    if source == "mp3j_yt":
-        yt_id = track.get("yt_id", "")
-        yt_url = f"https://www.youtube.com/watch?v={yt_id}"
-        await _download_and_send_yt_cb(yt_url, cb, update.effective_chat.id, context, cache_key=title)
-        return
+        # ── mp3j YouTube: تحميل عبر savemp3 ────────────────────────────
+        if source == "mp3j_yt":
+            yt_id = track.get("yt_id", "")
+            yt_url = f"https://www.youtube.com/watch?v={yt_id}"
+            await _download_and_send_yt_cb(yt_url, cb, update.effective_chat.id, context, cache_key=title)
+            return
 
-    # ── nogomistars.com: تحميل مباشر ───────────────────────────────
-    if source == "nogomi":
-        dl_url = track["dl_url"]
-        file_path, dl_title, _ = await loop.run_in_executor(
-            None, nogomistars_download, dl_url, title
-        )
-        if file_path and os.path.exists(file_path):
-            try:
-                size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                if size_mb > 50:
-                    await cb.edit_message_text(
-                        f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
-                    )
-                    return
-                await cb.edit_message_text(
-                    f"📤 جاري الإرسال...\n🎵 *{title}*",
-                    parse_mode="Markdown",
-                )
-                ok2, file_id = await send_audio_file(
-                    context.bot, update.effective_chat.id, file_path,
-                    title=song_title or title, duration_str="", performer=artist)
-                if ok2:
-                    if file_id: cache_set(title, file_id)
-                    await cb.delete_message()
-                else:
-                    await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
-                return
-            finally:
-                if os.path.exists(file_path):
-                    try: os.unlink(file_path)
-                    except Exception: pass
-        # تحميل مباشر فشل → savemp3
-        yt_id = track.get("yt_id")
-        if yt_id:
-            await _download_and_send_yt_cb(f"https://www.youtube.com/watch?v={yt_id}",
-                cb, update.effective_chat.id, context, cache_key=title)
-        else:
-            await _fallback_search_download(title, cb.message, update.effective_chat.id, context)
-        return
-
-    # ── mp3j.cc: WebSocket prepare → direct MP3 download ───────────
-    track_id = track["id"]
-    duration = track["duration"]
-    query    = track["query"]
-
-    ok = await mp3j_prepare(track_id, query)
-    if not ok:
-        await _fallback_search_download(title, cb.message, update.effective_chat.id, context)
-        return
-
-    await cb.edit_message_text(
-        f"📥 جاري التحميل...\n🎵 *{title}*",
-        parse_mode="Markdown",
-    )
-
-    loop      = asyncio.get_event_loop()
-    file_path = await loop.run_in_executor(None, mp3j_download, track_id, query, title)
-
-    if not file_path or not os.path.exists(file_path):
-        await _fallback_search_download(title, cb.message, update.effective_chat.id, context)
-        return
-
-    try:
-        size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        if size_mb > 50:
-            await cb.edit_message_text(
-                f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
+        # ── nogomistars.com: تحميل مباشر ───────────────────────────────
+        if source == "nogomi":
+            dl_url = track["dl_url"]
+            fp, dl_title, _ = await loop.run_in_executor(
+                None, nogomistars_download, dl_url, title
             )
+            if fp and os.path.exists(fp):
+                try:
+                    size_mb = os.path.getsize(fp) / (1024 * 1024)
+                    if size_mb > 50:
+                        await cb.edit_message_text(
+                            f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
+                        )
+                        return
+                    await cb.edit_message_text(
+                        f"📤 جاري الإرسال...\n🎵 *{title}*",
+                        parse_mode="Markdown",
+                    )
+                    ok2, file_id = await send_audio_file(
+                        context.bot, update.effective_chat.id, fp,
+                        title=song_title or title, duration_str="", performer=artist)
+                    if ok2:
+                        if file_id: cache_set(title, file_id)
+                        await cb.delete_message()
+                    else:
+                        await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
+                    return
+                finally:
+                    if os.path.exists(fp):
+                        try: os.unlink(fp)
+                        except Exception: pass
+            # تحميل مباشر فشل → savemp3
+            yt_id = track.get("yt_id")
+            if yt_id:
+                await _download_and_send_yt_cb(f"https://www.youtube.com/watch?v={yt_id}",
+                    cb, update.effective_chat.id, context, cache_key=title)
+            else:
+                await _fallback_search_download(title, cb.message, update.effective_chat.id, context)
+            return
+
+        # ── mp3j.cc: WebSocket prepare → direct MP3 download ───────────
+        track_id = track["id"]
+        duration = track["duration"]
+        query    = track["query"]
+
+        ok = await mp3j_prepare(track_id, query)
+        if not ok:
+            await _fallback_search_download(title, cb.message, update.effective_chat.id, context)
             return
 
         await cb.edit_message_text(
-            f"📤 جاري الإرسال...\n🎵 *{title}*",
+            f"📥 جاري التحميل...\n🎵 *{title}*",
             parse_mode="Markdown",
         )
 
-        ok2, file_id = await send_audio_file(
-            context.bot, update.effective_chat.id, file_path,
-            title=song_title or title, duration_str=duration, performer=artist)
-        if ok2:
-            if file_id: cache_set(title, file_id)
-            await cb.delete_message()
-        else:
-            await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
-    finally:
-        if file_path and os.path.exists(file_path):
-            try: os.unlink(file_path)
-            except Exception: pass
+        fp2 = await loop.run_in_executor(None, mp3j_download, track_id, query, title)
+
+        if not fp2 or not os.path.exists(fp2):
+            await _fallback_search_download(title, cb.message, update.effective_chat.id, context)
+            return
+
+        try:
+            size_mb = os.path.getsize(fp2) / (1024 * 1024)
+            if size_mb > 50:
+                await cb.edit_message_text(
+                    f"❌ الملف كبير ({size_mb:.1f}MB)، تلغرام لا يقبل أكثر من 50MB."
+                )
+                return
+
+            await cb.edit_message_text(
+                f"📤 جاري الإرسال...\n🎵 *{title}*",
+                parse_mode="Markdown",
+            )
+
+            ok2, file_id = await send_audio_file(
+                context.bot, update.effective_chat.id, fp2,
+                title=song_title or title, duration_str=duration, performer=artist)
+            if ok2:
+                if file_id: cache_set(title, file_id)
+                await cb.delete_message()
+            else:
+                await cb.edit_message_text("❌ حدث خطأ أثناء الإرسال.")
+        finally:
+            if fp2 and os.path.exists(fp2):
+                try: os.unlink(fp2)
+                except Exception: pass
+
+    try:
+        await asyncio.wait_for(_do_download(), timeout=75)
+    except asyncio.TimeoutError:
+        logger.warning(f"handle_download timeout for: {title}")
+        try:
+            await cb.edit_message_text("⌛ استغرق التحميل وقتاً طويلاً، جرب مرة ثانية.")
+        except Exception:
+            pass
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
