@@ -19,6 +19,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from voice_service import voice_svc
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -54,6 +55,15 @@ def _save_groups(groups: set[int]) -> None:
         json.dump(list(groups), f)
 
 ALLOWED_GROUPS: set[int] = _load_groups()
+
+# ── Voice call state ───────────────────────────────────────────────────────────
+# queue item: {"file": str, "title": str, "user_id": int}
+_vc_queue:    dict[int, list] = {}
+_vc_playing:  dict[int, dict] = {}
+_vc_ctrl_msg: dict[int, int]  = {}
+_vc_paused:   dict[int, bool] = {}
+_app: "Application | None"    = None   # set in post_init; used by stream-end callback
+
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -991,10 +1001,171 @@ async def yot_youtube(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── شغل: يوتيوب بحث → ar.savemp3.net تحميل ─────────────────────────────────
 
+async def _download_for_voice(query: str) -> tuple[str | None, str]:
+    """
+    يحمّل ملف صوتي للتشغيل في المكالمة (لا يُرسَل لتيليجرام).
+    الترتيب: mp3j SoundCloud → yt-dlp YouTube.
+    يرجع (file_path, title) أو (None, "").
+    """
+    loop = asyncio.get_event_loop()
+
+    # ── 1: mp3j SoundCloud ──────────────────────────────────────────
+    mp3j_results = await loop.run_in_executor(None, mp3j_search, query)
+    if mp3j_results:
+        track    = mp3j_results[0]
+        track_id = track["id"]
+        title    = track["title"]
+        query_q  = track["query"]
+        ok = await mp3j_prepare(track_id, query_q)
+        if ok:
+            fp = await loop.run_in_executor(None, mp3j_download, track_id, query_q, title)
+            if fp and os.path.exists(fp):
+                return fp, title
+
+    # ── 2: yt-dlp YouTube ────────────────────────────────────────────
+    yt_url = await loop.run_in_executor(None, youtube_search_first, query)
+    if yt_url:
+        fp2, title2, _ = await loop.run_in_executor(None, ytdlp_download, yt_url)
+        if fp2 and os.path.exists(fp2):
+            return fp2, title2 or query
+
+    return None, ""
+
+
 async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     """
-    شغل [اسم الأغنية]:
-      الترتيب: mp3j.cc → sm3ha.io → savemp3.net → nogomistars.com
+    شغل [اسم الأغنية] — يحمّل الأغنية ويشغّلها في مكالمة المجموعة الصوتية.
+    يحتاج TELEGRAM_API_ID + TELEGRAM_API_HASH على Railway و /qr مرة واحدة.
+    """
+    chat_id = msg.chat_id
+    user_id = msg.from_user.id if msg.from_user else 0
+
+    # ── تحقق من توفر الخدمة ─────────────────────────────────────────
+    if not voice_svc.enabled:
+        await msg.reply_text(
+            "⚠️ *ميزة المكالمات الصوتية غير مفعّلة*\n\n"
+            "أضف المتغيرات التالية في Railway:\n"
+            "• `TELEGRAM_API_ID`\n"
+            "• `TELEGRAM_API_HASH`\n\n"
+            "احصل عليها من my.telegram.org ← API development tools",
+            parse_mode="Markdown",
+        )
+        return
+
+    if not voice_svc.logged_in:
+        await msg.reply_text(
+            "📱 *لا يوجد حساب متصل بعد*\n\n"
+            "يرسل المالك الأمر `/qr` لتسجيل الدخول بكود QR ثم جرب مجدداً.",
+            parse_mode="Markdown",
+        )
+        return
+
+    wait_msg = await msg.reply_text(f"🔍 *{query}*...", parse_mode="Markdown")
+
+    # ── تحميل الملف الصوتي ──────────────────────────────────────────
+    await wait_msg.edit_text(f"⏳ جاري التحميل...\n🎵 *{query}*", parse_mode="Markdown")
+    file_path, title = await _download_for_voice(query)
+
+    if not file_path:
+        await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
+        return
+
+    await wait_msg.delete()
+    title = title or query
+
+    # ── أضف للطابور ──────────────────────────────────────────────────
+    q = _vc_queue.setdefault(chat_id, [])
+    item = {"file": file_path, "title": title, "user_id": user_id}
+    q.append(item)
+
+    if len(q) > 1:
+        await msg.reply_text(f"➕ أُضيفت للطابور (#{len(q)}): *{title}*", parse_mode="Markdown")
+        return
+
+    # ── ابدأ التشغيل ──────────────────────────────────────────────────
+    result = await voice_svc.join_and_play(chat_id, file_path)
+    if not result["ok"]:
+        err = result.get("error", "خطأ غير معروف")
+        await msg.reply_text(f"❌ فشل التشغيل:\n`{err[:300]}`", parse_mode="Markdown")
+        q.pop()
+        if os.path.exists(file_path):
+            try:
+                os.unlink(file_path)
+            except Exception:
+                pass
+        return
+
+    _vc_playing[chat_id] = item
+    _vc_paused[chat_id] = False
+    await _vc_send_ctrl(context.bot, chat_id, title)
+
+
+async def cmd_shaghl_stop(msg, context: ContextTypes.DEFAULT_TYPE):
+    """وقف — يوقف المكالمة الصوتية ويمسح الطابور."""
+    chat_id = msg.chat_id
+
+    if not _vc_playing.get(chat_id) and not _vc_queue.get(chat_id):
+        await msg.reply_text("🔇 لا يوجد تشغيل حالياً.")
+        return
+
+    # امسح الطابور أولاً لمنع auto-advance
+    items = _vc_queue.pop(chat_id, [])
+    _vc_playing.pop(chat_id, None)
+    _vc_paused.pop(chat_id, None)
+
+    # احذف رسالة التحكم
+    old_mid = _vc_ctrl_msg.pop(chat_id, None)
+    if old_mid:
+        try:
+            await context.bot.delete_message(chat_id, old_mid)
+        except Exception:
+            pass
+
+    # أوقف المكالمة
+    await voice_svc.stop(chat_id)
+
+    # احذف الملفات المؤقتة
+    for it in items:
+        fp = it.get("file", "")
+        if fp and os.path.exists(fp):
+            try:
+                os.unlink(fp)
+            except Exception:
+                pass
+
+    await msg.reply_text("⏹ تم إيقاف التشغيل.")
+
+
+async def cmd_shaghl_pause(msg, context: ContextTypes.DEFAULT_TYPE):
+    """وقفة — إيقاف مؤقت / استئناف."""
+    chat_id = msg.chat_id
+    if not _vc_playing.get(chat_id):
+        await msg.reply_text("🔇 لا يوجد تشغيل حالياً.")
+        return
+
+    paused = _vc_paused.get(chat_id, False)
+    if paused:
+        r = await voice_svc.resume(chat_id)
+        _vc_paused[chat_id] = False
+        lbl = "▶️ استُؤنف التشغيل."
+    else:
+        r = await voice_svc.pause(chat_id)
+        _vc_paused[chat_id] = True
+        lbl = "⏸ تم الإيقاف المؤقت."
+
+    if r["ok"]:
+        title = _vc_playing[chat_id].get("title", "")
+        await _vc_send_ctrl(context.bot, chat_id, title, paused=not paused)
+        await msg.reply_text(lbl)
+    else:
+        await msg.reply_text(f"❌ {r.get('error', 'خطأ')}")
+
+
+# ── OLD cmd_shaghl placeholder kept here so the old nogomistars fallback chain is accessible ──
+async def _shaghl_old_send(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
+    """
+    [داخلي] النسخة القديمة من شغل (تحميل + إرسال ملف بدون مكالمة).
+    غير مستخدمة الآن — محفوظة للرجوع إليها.
     """
     cached_fid = cache_get(query)
     if cached_fid:
@@ -1136,12 +1307,183 @@ async def cmd_deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("اكتب ID المجموعة: `/deny -1001234567890`", parse_mode="Markdown")
 
 
+async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /qr — للمالك فقط.
+    يبدأ جلسة QR login لحساب تلغرام يدخل المكالمات الصوتية.
+    """
+    msg = update.message
+    if not msg:
+        return
+    if update.effective_user.id != OWNER_ID:
+        await msg.reply_text("⛔ هذا الأمر للمالك فقط.")
+        return
+    if not voice_svc.enabled:
+        await msg.reply_text(
+            "⚠️ *الخدمة غير مفعّلة*\n\n"
+            "أضف في Railway:\n`TELEGRAM_API_ID` و `TELEGRAM_API_HASH`\n"
+            "احصل عليهما من my.telegram.org",
+            parse_mode="Markdown",
+        )
+        return
+
+    status_msg = await msg.reply_text("🔄 جاري إنشاء رمز QR...")
+
+    async def on_qr_url(url: str):
+        try:
+            qr_image_url = (
+                f"https://api.qrserver.com/v1/create-qr-code/"
+                f"?size=300x300&data={requests.utils.quote(url)}"
+            )
+            await status_msg.delete()
+            await context.bot.send_photo(
+                msg.chat_id,
+                qr_image_url,
+                caption=(
+                    "📱 *امسح الرمز بتطبيق تلغرام*\n\n"
+                    "الإعدادات ← الأجهزة ← ربط جهاز جديد\n\n"
+                    "⏳ صالح لمدة دقيقتين"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"[qr] send photo error: {e}")
+            await status_msg.edit_text(f"📱 رابط QR:\n`{url}`", parse_mode="Markdown")
+
+    async def on_done(result: dict):
+        try:
+            if result["ok"]:
+                name = result.get("name", "")
+                sess = result.get("session_string", "")
+                await context.bot.send_message(
+                    msg.chat_id,
+                    f"✅ *تم تسجيل الدخول بنجاح!*\n"
+                    f"👤 الحساب: {name}\n\n"
+                    f"💾 تم حفظ الجلسة تلقائياً — لن تحتاج /qr مرة أخرى بعد إعادة التشغيل.\n\n"
+                    f"يمكنك أيضاً حفظ هذه الجلسة في Railway:\n"
+                    f"`TELEGRAM_SESSION_STRING` = `{sess[:20]}...`",
+                    parse_mode="Markdown",
+                )
+            else:
+                err = result.get("error", "خطأ غير معروف")
+                await context.bot.send_message(
+                    msg.chat_id,
+                    f"❌ فشل تسجيل الدخول:\n{err}",
+                )
+        except Exception as e:
+            logger.error(f"[qr] on_done error: {e}")
+
+    await voice_svc.qr_login(on_qr_url, on_done)
+
+
+async def handle_vc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """vc:action:chat_id — أزرار التحكم بالمكالمة الصوتية."""
+    cb = update.callback_query
+    if not cb:
+        return
+    await cb.answer()
+
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3:
+        return
+    _, action, chat_id_str = parts
+    try:
+        chat_id = int(chat_id_str)
+    except ValueError:
+        return
+
+    if action == "pause":
+        paused = _vc_paused.get(chat_id, False)
+        if paused:
+            r = await voice_svc.resume(chat_id)
+            _vc_paused[chat_id] = False
+            new_paused = False
+        else:
+            r = await voice_svc.pause(chat_id)
+            _vc_paused[chat_id] = True
+            new_paused = True
+        if r["ok"]:
+            title = _vc_playing.get(chat_id, {}).get("title", "")
+            pause_lbl = "▶️ استئناف" if new_paused else "⏸ إيقاف مؤقت"
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(pause_lbl,       callback_data=f"vc:pause:{chat_id}"),
+                InlineKeyboardButton("⏭ التالي",      callback_data=f"vc:next:{chat_id}"),
+                InlineKeyboardButton("⏹ وقف",         callback_data=f"vc:stop:{chat_id}"),
+            ]])
+            try:
+                await cb.edit_message_reply_markup(kb)
+            except Exception:
+                pass
+        else:
+            await cb.answer(r.get("error", "خطأ")[:200], show_alert=True)
+
+    elif action == "next":
+        q = _vc_queue.get(chat_id, [])
+        if not q:
+            await cb.answer("🔇 الطابور فارغ.", show_alert=True)
+            return
+        old_item = q.pop(0)
+        fp = old_item.get("file", "")
+        if fp and os.path.exists(fp):
+            try:
+                os.unlink(fp)
+            except Exception:
+                pass
+        if q:
+            next_item = q[0]
+            result = await voice_svc.join_and_play(chat_id, next_item["file"])
+            if result["ok"]:
+                _vc_playing[chat_id] = next_item
+                _vc_paused[chat_id] = False
+                await _vc_send_ctrl(context.bot, chat_id, next_item["title"])
+            else:
+                await cb.answer(f"❌ {result.get('error','')[:100]}", show_alert=True)
+        else:
+            await voice_svc.stop(chat_id)
+            _vc_playing.pop(chat_id, None)
+            _vc_paused.pop(chat_id, None)
+            old_mid = _vc_ctrl_msg.pop(chat_id, None)
+            if old_mid:
+                try:
+                    await context.bot.delete_message(chat_id, old_mid)
+                except Exception:
+                    pass
+            await context.bot.send_message(chat_id, "⏹ انتهى الطابور.")
+
+    elif action == "stop":
+        items = _vc_queue.pop(chat_id, [])
+        _vc_playing.pop(chat_id, None)
+        _vc_paused.pop(chat_id, None)
+        old_mid = _vc_ctrl_msg.pop(chat_id, None)
+        if old_mid:
+            try:
+                await context.bot.delete_message(chat_id, old_mid)
+            except Exception:
+                pass
+        await voice_svc.stop(chat_id)
+        for it in items:
+            fp = it.get("file", "")
+            if fp and os.path.exists(fp):
+                try:
+                    os.unlink(fp)
+                except Exception:
+                    pass
+        await context.bot.send_message(chat_id, "⏹ تم إيقاف التشغيل.")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vc_status = ""
+    if voice_svc.enabled:
+        if voice_svc.logged_in:
+            vc_status = "\n• `شغل [أغنية]` — تشغيل في مكالمة صوتية\n• `وقف` · `وقفة` · `كمل` · `قائمة`"
+        else:
+            vc_status = "\n• `شغل [أغنية]` — تشغيل صوتي *(يحتاج /qr أولاً)*"
     await update.message.reply_text(
         "🎵 *بوت أغاني*\n\n"
         "الأوامر:\n"
         "• `بحث [اسم الأغنية]` — قائمة نتائج للاختيار\n"
-        "• `يوت [اسم الأغنية]` — تحميل فوري\n\n"
+        "• `يوت [اسم الأغنية]` — تحميل فوري"
+        + vc_status + "\n\n"
         "أمثلة:\n"
         "`بحث طلال مداح`\n"
         "`يوت محمد عبده`",
@@ -1169,6 +1511,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     is_shaghl = False
 
+    # ── أوامر التحكم بالمكالمة الصوتية (بدون استعلام) ──────────────
+    if text in ("وقف", "ايقاف", "إيقاف"):
+        await cmd_shaghl_stop(msg, context)
+        return
+    if text in ("وقفة", "بوز", "pause"):
+        await cmd_shaghl_pause(msg, context)
+        return
+    if text in ("كمل", "استئناف", "resume"):
+        await cmd_shaghl_pause(msg, context)   # toggle
+        return
+    if text in ("قائمة", "الطابور"):
+        q = _vc_queue.get(msg.chat_id, [])
+        playing = _vc_playing.get(msg.chat_id)
+        if not playing and not q:
+            await msg.reply_text("🔇 الطابور فارغ.")
+        else:
+            lines = []
+            if playing:
+                lines.append(f"▶️ *الآن:* {playing['title']}")
+            for i, it in enumerate(q[1:], start=2):
+                lines.append(f"{i}. {it['title']}")
+            await msg.reply_text("\n".join(lines) or "🔇 لا يوجد.", parse_mode="Markdown")
+        return
+
     if text.startswith("بحث "):
         query = text[4:].strip()
     elif text.startswith("يوت "):
@@ -1192,7 +1558,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
 
-    # ── شغل: يوتيوب → ar.savemp3.net ──────────────────────────────
+    # ── شغل: تشغيل في مكالمة صوتية ─────────────────────────────────
     if is_shaghl:
         await cmd_shaghl(msg, query, context)
         return
@@ -1413,12 +1779,78 @@ async def handle_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+async def _on_stream_end(chat_id: int):
+    """Callback called by voice_svc when a track finishes playing."""
+    global _app
+    q = _vc_queue.get(chat_id, [])
+    if q:
+        old_item = q.pop(0)
+        fp = old_item.get("file", "")
+        if fp and os.path.exists(fp):
+            try:
+                os.unlink(fp)
+            except Exception:
+                pass
+
+    if q and _app:
+        next_item = q[0]
+        result = await voice_svc.join_and_play(chat_id, next_item["file"])
+        if result["ok"]:
+            _vc_playing[chat_id] = next_item
+            _vc_paused[chat_id] = False
+            await _vc_send_ctrl(_app.bot, chat_id, next_item["title"])
+        else:
+            q.pop(0)
+            fp2 = next_item.get("file", "")
+            if fp2 and os.path.exists(fp2):
+                try:
+                    os.unlink(fp2)
+                except Exception:
+                    pass
+            await _on_stream_end(chat_id)
+    else:
+        _vc_playing.pop(chat_id, None)
+        _vc_paused.pop(chat_id, None)
+        old_mid = _vc_ctrl_msg.pop(chat_id, None)
+        if old_mid and _app:
+            try:
+                await _app.bot.delete_message(chat_id, old_mid)
+            except Exception:
+                pass
+
+
+async def _vc_send_ctrl(bot, chat_id: int, title: str, paused: bool = False):
+    """Sends (or re-sends) the playback control message."""
+    old_mid = _vc_ctrl_msg.pop(chat_id, None)
+    if old_mid:
+        try:
+            await bot.delete_message(chat_id, old_mid)
+        except Exception:
+            pass
+    pause_lbl = "▶️ استئناف" if paused else "⏸ إيقاف مؤقت"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(pause_lbl,       callback_data=f"vc:pause:{chat_id}"),
+        InlineKeyboardButton("⏭ التالي",      callback_data=f"vc:next:{chat_id}"),
+        InlineKeyboardButton("⏹ وقف",         callback_data=f"vc:stop:{chat_id}"),
+    ]])
+    sent = await bot.send_message(
+        chat_id,
+        f"▶️ *{title}*",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+    _vc_ctrl_msg[chat_id] = sent.message_id
+
+
 async def post_init(application: Application) -> None:
-    """يجيب اسم المستخدم للبوت بعد ما يشتغل."""
-    global BOT_USERNAME
+    """يجيب اسم المستخدم للبوت بعد ما يشتغل + يشغّل خدمة المكالمات الصوتية."""
+    global BOT_USERNAME, _app
     me = await application.bot.get_me()
     BOT_USERNAME = me.username or ""
     logger.info(f"Bot username: @{BOT_USERNAME}")
+    _app = application
+    voice_svc.set_stream_end_callback(_on_stream_end)
+    await voice_svc.start()
 
 
 def main():
@@ -1436,7 +1868,9 @@ def main():
     app.add_handler(CommandHandler("help", start))
     app.add_handler(CommandHandler("allow", cmd_allow))
     app.add_handler(CommandHandler("deny", cmd_deny))
+    app.add_handler(CommandHandler("qr", cmd_qr))
     app.add_handler(CallbackQueryHandler(handle_download, pattern=r"^dl_\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_vc_callback, pattern=r"^vc:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot started!")
