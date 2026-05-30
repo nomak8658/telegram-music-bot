@@ -1100,12 +1100,33 @@ async def cmd_shaghl(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
     await _vc_send_ctrl(context.bot, chat_id, title)
 
 
+async def _can_stop_vc(user_id: int, chat_id: int, bot) -> bool:
+    """يتحقق إذا المستخدم يقدر يوقف المكالمة: يلي شغّل الأغنية أو المشرفين."""
+    playing = _vc_playing.get(chat_id, {})
+    if playing.get("user_id") == user_id:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
 async def cmd_shaghl_stop(msg, context: ContextTypes.DEFAULT_TYPE):
     """وقف — يوقف المكالمة الصوتية ويمسح الطابور."""
     chat_id = msg.chat_id
+    user_id = msg.from_user.id if msg.from_user else 0
 
     if not _vc_playing.get(chat_id) and not _vc_queue.get(chat_id):
         await msg.reply_text("**🔇 ما في شيء يشتغل الحين**", parse_mode="Markdown")
+        return
+
+    if not await _can_stop_vc(user_id, chat_id, context.bot):
+        await msg.reply_text(
+            "**🚫 ما تقدر توقف التشغيل**\n"
+            "فقط يلي شغّل الأغنية أو المشرفين يقدرون يوقفون",
+            parse_mode="Markdown",
+        )
         return
 
     # امسح الطابور أولاً لمنع auto-advance
@@ -1470,6 +1491,10 @@ async def handle_vc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await context.bot.send_message(chat_id, "⏹ انتهى الطابور.")
 
     elif action == "stop":
+        user_id = cb.from_user.id if cb.from_user else 0
+        if not await _can_stop_vc(user_id, chat_id, context.bot):
+            await cb.answer("🚫 فقط يلي شغّل الأغنية أو المشرفين يقدرون يوقفون", show_alert=True)
+            return
         items = _vc_queue.pop(chat_id, [])
         _vc_playing.pop(chat_id, None)
         _vc_paused.pop(chat_id, None)
@@ -1487,7 +1512,7 @@ async def handle_vc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     os.unlink(fp)
                 except Exception:
                     pass
-        await context.bot.send_message(chat_id, "⏹ تم إيقاف التشغيل.")
+        await context.bot.send_message(chat_id, "**تم إيقاف التشغيل ✅**", parse_mode="Markdown")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
