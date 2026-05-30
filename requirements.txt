@@ -2,3 +2,5 @@ python-telegram-bot==22.7
 requests==2.34.2
 websockets==15.0.1
 yt-dlp==2025.1.15
+telethon
+pytgcalls
