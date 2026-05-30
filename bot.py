@@ -62,6 +62,7 @@ _vc_queue:    dict[int, list] = {}
 _vc_playing:  dict[int, dict] = {}
 _vc_ctrl_msg: dict[int, int]  = {}
 _vc_paused:   dict[int, bool] = {}
+_vc_repeat:   dict[int, int]  = {}   # عدد مرات التكرار المتبقية (0 = لا تكرار)
 _app: "Application | None"    = None   # set in post_init; used by stream-end callback
 
 
@@ -1133,6 +1134,7 @@ async def cmd_shaghl_stop(msg, context: ContextTypes.DEFAULT_TYPE):
     items = _vc_queue.pop(chat_id, [])
     _vc_playing.pop(chat_id, None)
     _vc_paused.pop(chat_id, None)
+    _vc_repeat.pop(chat_id, None)
 
     # احذف رسالة التحكم
     old_mid = _vc_ctrl_msg.pop(chat_id, None)
@@ -1490,6 +1492,36 @@ async def handle_vc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     pass
             await context.bot.send_message(chat_id, "⏹ انتهى الطابور.")
 
+    elif action == "repeat":
+        current_n = _vc_repeat.get(chat_id, 0)
+        new_n = (current_n + 1) % 7   # 0→1→2→3→4→5→6→0
+        _vc_repeat[chat_id] = new_n
+        title = _vc_playing.get(chat_id, {}).get("title", "")
+        paused = _vc_paused.get(chat_id, False)
+        repeat_lbl = f"🔂  ×{new_n}" if new_n else "🔁  تكرار"
+        pause_lbl  = "▶️  كمل" if paused else "⏸  وقفة"
+        status     = "⏸ متوقف مؤقتاً" if paused else "▶️ يُشغَّل الآن"
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(pause_lbl,   callback_data=f"vc:pause:{chat_id}"),
+                InlineKeyboardButton("⏭  التالي", callback_data=f"vc:next:{chat_id}"),
+                InlineKeyboardButton(repeat_lbl,  callback_data=f"vc:repeat:{chat_id}"),
+            ],
+            [
+                InlineKeyboardButton("⏹  إيقاف التشغيل", callback_data=f"vc:stop:{chat_id}"),
+            ],
+        ])
+        try:
+            await cb.edit_message_text(
+                f"{status}\n━━━━━━━━━━━━\n🎶 *{title}*",
+                parse_mode="Markdown",
+                reply_markup=kb,
+            )
+        except Exception:
+            pass
+        lbl = f"🔂 سيتكرر ×{new_n}" if new_n else "🔁 إيقاف التكرار"
+        await cb.answer(lbl)
+
     elif action == "stop":
         user_id = cb.from_user.id if cb.from_user else 0
         if not await _can_stop_vc(user_id, chat_id, context.bot):
@@ -1498,6 +1530,7 @@ async def handle_vc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         items = _vc_queue.pop(chat_id, [])
         _vc_playing.pop(chat_id, None)
         _vc_paused.pop(chat_id, None)
+        _vc_repeat.pop(chat_id, None)
         old_mid = _vc_ctrl_msg.pop(chat_id, None)
         if old_mid:
             try:
@@ -1845,6 +1878,24 @@ async def _on_stream_end(chat_id: int):
     """Callback called by voice_svc when a track finishes playing."""
     global _app
     q = _vc_queue.get(chat_id, [])
+
+    # ── تكرار: إذا فيه عدد مرات متبقية أعد نفس الأغنية ──────────────
+    repeat_n = _vc_repeat.get(chat_id, 0)
+    if repeat_n > 0 and q and _app:
+        _vc_repeat[chat_id] = repeat_n - 1
+        current = q[0]
+        result = await voice_svc.join_and_play(chat_id, current["file"])
+        if result["ok"]:
+            _vc_playing[chat_id] = current
+            _vc_paused[chat_id] = False
+            await _vc_send_ctrl(_app.bot, chat_id, current["title"])
+        else:
+            # فشل التكرار — تابع بالطابور العادي
+            _vc_repeat[chat_id] = 0
+            await _on_stream_end(chat_id)
+        return
+
+    # ── تقدّم الطابور العادي ─────────────────────────────────────────
     if q:
         old_item = q.pop(0)
         fp = old_item.get("file", "")
@@ -1889,12 +1940,15 @@ async def _vc_send_ctrl(bot, chat_id: int, title: str, paused: bool = False):
             await bot.delete_message(chat_id, old_mid)
         except Exception:
             pass
-    pause_lbl = "▶️  كمل" if paused else "⏸  وقفة"
-    status    = "⏸ متوقف مؤقتاً" if paused else "▶️ يُشغَّل الآن"
+    pause_lbl  = "▶️  كمل" if paused else "⏸  وقفة"
+    status     = "⏸ متوقف مؤقتاً" if paused else "▶️ يُشغَّل الآن"
+    repeat_n   = _vc_repeat.get(chat_id, 0)
+    repeat_lbl = f"🔂  ×{repeat_n}" if repeat_n else "🔁  تكرار"
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(pause_lbl,        callback_data=f"vc:pause:{chat_id}"),
-            InlineKeyboardButton("⏭  التالي",      callback_data=f"vc:next:{chat_id}"),
+            InlineKeyboardButton(pause_lbl,   callback_data=f"vc:pause:{chat_id}"),
+            InlineKeyboardButton("⏭  التالي", callback_data=f"vc:next:{chat_id}"),
+            InlineKeyboardButton(repeat_lbl,  callback_data=f"vc:repeat:{chat_id}"),
         ],
         [
             InlineKeyboardButton("⏹  إيقاف التشغيل", callback_data=f"vc:stop:{chat_id}"),
