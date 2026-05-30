@@ -1105,7 +1105,7 @@ async def cmd_shaghl_stop(msg, context: ContextTypes.DEFAULT_TYPE):
     chat_id = msg.chat_id
 
     if not _vc_playing.get(chat_id) and not _vc_queue.get(chat_id):
-        await msg.reply_text("🔇 لا يوجد تشغيل حالياً.")
+        await msg.reply_text("🔇 ما في شيء يشتغل الحين")
         return
 
     # امسح الطابور أولاً لمنع auto-advance
@@ -1133,25 +1133,25 @@ async def cmd_shaghl_stop(msg, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-    await msg.reply_text("⏹ تم إيقاف التشغيل.")
+    await msg.reply_text("تم إيقاف التشغيل ✅")
 
 
 async def cmd_shaghl_pause(msg, context: ContextTypes.DEFAULT_TYPE):
     """وقفة — إيقاف مؤقت / استئناف."""
     chat_id = msg.chat_id
     if not _vc_playing.get(chat_id):
-        await msg.reply_text("🔇 لا يوجد تشغيل حالياً.")
+        await msg.reply_text("🔇 ما في شيء يشتغل الحين")
         return
 
     paused = _vc_paused.get(chat_id, False)
     if paused:
         r = await voice_svc.resume(chat_id)
         _vc_paused[chat_id] = False
-        lbl = "▶️ استُؤنف التشغيل."
+        lbl = "▶️ كمل التشغيل"
     else:
         r = await voice_svc.pause(chat_id)
         _vc_paused[chat_id] = True
-        lbl = "⏸ تم الإيقاف المؤقت."
+        lbl = "⏸ توقف مؤقت"
 
     if r["ok"]:
         title = _vc_playing[chat_id].get("title", "")
@@ -1414,14 +1414,23 @@ async def handle_vc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             new_paused = True
         if r["ok"]:
             title = _vc_playing.get(chat_id, {}).get("title", "")
-            pause_lbl = "▶️ استئناف" if new_paused else "⏸ إيقاف مؤقت"
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(pause_lbl,       callback_data=f"vc:pause:{chat_id}"),
-                InlineKeyboardButton("⏭ التالي",      callback_data=f"vc:next:{chat_id}"),
-                InlineKeyboardButton("⏹ وقف",         callback_data=f"vc:stop:{chat_id}"),
-            ]])
+            pause_lbl = "▶️  كمل" if new_paused else "⏸  وقفة"
+            status    = "⏸ متوقف مؤقتاً" if new_paused else "▶️ يُشغَّل الآن"
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(pause_lbl,           callback_data=f"vc:pause:{chat_id}"),
+                    InlineKeyboardButton("⏭  التالي",         callback_data=f"vc:next:{chat_id}"),
+                ],
+                [
+                    InlineKeyboardButton("⏹  إيقاف التشغيل", callback_data=f"vc:stop:{chat_id}"),
+                ],
+            ])
             try:
-                await cb.edit_message_reply_markup(kb)
+                await cb.edit_message_text(
+                    f"{status}\n━━━━━━━━━━━━\n🎶 *{title}*",
+                    parse_mode="Markdown",
+                    reply_markup=kb,
+                )
             except Exception:
                 pass
         else:
@@ -1430,7 +1439,7 @@ async def handle_vc_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif action == "next":
         q = _vc_queue.get(chat_id, [])
         if not q:
-            await cb.answer("🔇 الطابور فارغ.", show_alert=True)
+            await cb.answer("ما في أغاني بعدين في الطابور", show_alert=True)
             return
         old_item = q.pop(0)
         fp = old_item.get("file", "")
@@ -1535,14 +1544,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = _vc_queue.get(msg.chat_id, [])
         playing = _vc_playing.get(msg.chat_id)
         if not playing and not q:
-            await msg.reply_text("🔇 الطابور فارغ.")
+            await msg.reply_text("🔇 الطابور فاضي، ما في شيء يشتغل")
         else:
-            lines = []
+            lines = ["🎶 *قائمة التشغيل*", "━━━━━━━━━━━━"]
             if playing:
-                lines.append(f"▶️ *الآن:* {playing['title']}")
+                lines.append(f"▶️ *الحين:* {playing['title']}")
             for i, it in enumerate(q[1:], start=2):
-                lines.append(f"{i}. {it['title']}")
-            await msg.reply_text("\n".join(lines) or "🔇 لا يوجد.", parse_mode="Markdown")
+                lines.append(f"  {i}. {it['title']}")
+            await msg.reply_text("\n".join(lines), parse_mode="Markdown")
         return
 
     if text.startswith("بحث "):
@@ -1855,15 +1864,20 @@ async def _vc_send_ctrl(bot, chat_id: int, title: str, paused: bool = False):
             await bot.delete_message(chat_id, old_mid)
         except Exception:
             pass
-    pause_lbl = "▶️ استئناف" if paused else "⏸ إيقاف مؤقت"
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(pause_lbl,       callback_data=f"vc:pause:{chat_id}"),
-        InlineKeyboardButton("⏭ التالي",      callback_data=f"vc:next:{chat_id}"),
-        InlineKeyboardButton("⏹ وقف",         callback_data=f"vc:stop:{chat_id}"),
-    ]])
+    pause_lbl = "▶️  كمل" if paused else "⏸  وقفة"
+    status    = "⏸ متوقف مؤقتاً" if paused else "▶️ يُشغَّل الآن"
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(pause_lbl,        callback_data=f"vc:pause:{chat_id}"),
+            InlineKeyboardButton("⏭  التالي",      callback_data=f"vc:next:{chat_id}"),
+        ],
+        [
+            InlineKeyboardButton("⏹  إيقاف التشغيل", callback_data=f"vc:stop:{chat_id}"),
+        ],
+    ])
     sent = await bot.send_message(
         chat_id,
-        f"▶️ *{title}*",
+        f"{status}\n━━━━━━━━━━━━\n🎶 *{title}*",
         parse_mode="Markdown",
         reply_markup=kb,
     )
