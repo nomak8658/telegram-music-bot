@@ -1161,89 +1161,99 @@ async def cmd_shaghl_pause(msg, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ {r.get('error', 'خطأ')}")
 
 
-# ── OLD cmd_shaghl placeholder kept here so the old nogomistars fallback chain is accessible ──
-async def _shaghl_old_send(msg, query: str, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_shaghl_reply(msg, context: ContextTypes.DEFAULT_TYPE):
     """
-    [داخلي] النسخة القديمة من شغل (تحميل + إرسال ملف بدون مكالمة).
-    غير مستخدمة الآن — محفوظة للرجوع إليها.
+    رد على رسالة صوتية بكلمة 'شغل' — يحمّل الملف من تلغرام ويشغّله في المكالمة.
     """
-    cached_fid = cache_get(query)
-    if cached_fid:
-        ok = await send_cached(context.bot, msg.chat_id, cached_fid, query, "")
-        if ok:
-            return
+    chat_id = msg.chat_id
+    user_id = msg.from_user.id if msg.from_user else 0
 
-    wait_msg = await msg.reply_text(f"🔍 جاري البحث عن: *{query}*...", parse_mode="Markdown")
-    loop = asyncio.get_event_loop()
+    if not voice_svc.enabled:
+        await msg.reply_text(
+            "⚠️ *ميزة المكالمات الصوتية غير مفعّلة*\n\n"
+            "أضف `TELEGRAM_API_ID` و `TELEGRAM_API_HASH` في Railway.",
+            parse_mode="Markdown",
+        )
+        return
 
-    # ── 1: mp3j.cc ──────────────────────────────────────────────────
-    mp3j_results = await loop.run_in_executor(None, mp3j_search, query)
-    if mp3j_results:
-        track    = mp3j_results[0]
-        track_id = track["id"]
-        title_mp = track["title"]
-        query_q  = track["query"]
-        artist, song_title = split_artist_title(title_mp)
-        await wait_msg.edit_text(f"⏳ جاري التحضير...\n🎵 *{title_mp}*", parse_mode="Markdown")
-        ok = await mp3j_prepare(track_id, query_q)
-        if ok:
-            await wait_msg.edit_text(f"📥 جاري التحميل...\n🎵 *{title_mp}*", parse_mode="Markdown")
-            file_path = await loop.run_in_executor(None, mp3j_download, track_id, query_q, title_mp)
-            if file_path and os.path.exists(file_path):
-                try:
-                    ok2, file_id = await send_audio_file(context.bot, msg.chat_id, file_path,
-                        title=song_title or title_mp, duration_str=track["duration"], performer=artist)
-                    if ok2:
-                        if file_id: cache_set(query, file_id)
-                        await wait_msg.delete()
-                    else:
-                        await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
-                    return
-                finally:
-                    if os.path.exists(file_path):
-                        try: os.unlink(file_path)
-                        except Exception: pass
+    if not voice_svc.logged_in:
+        await msg.reply_text(
+            "📱 *لا يوجد حساب متصل*\n\n"
+            "المالك يرسل `/qr` لتسجيل الدخول أولاً.",
+            parse_mode="Markdown",
+        )
+        return
 
-    # ── 2: sm3ha.io → savemp3.net ────────────────────────────────────
-    sm3ha_res = await loop.run_in_executor(None, sm3ha_search_all, query)
-    yt_id = sm3ha_res[0]["yt_id"] if sm3ha_res else None
-    if yt_id:
-        await wait_msg.edit_text("⏳ جاري التحويل والتحميل...")
-        ok = await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id}",
-            wait_msg, msg.chat_id, context, cache_key=query)
-        if ok:
-            return
+    reply = msg.reply_to_message
+    if not reply or not (reply.audio or reply.voice or reply.document):
+        await msg.reply_text("↩️ رد على رسالة صوتية بـ *شغل* لتشغيلها في المكالمة.", parse_mode="Markdown")
+        return
 
-    # ── 3: nogomistars.com ───────────────────────────────────────────
-    nogomi_results = await loop.run_in_executor(None, nogomistars_search, query)
-    if nogomi_results:
-        track = nogomi_results[0]
-        await wait_msg.edit_text(f"📥 جاري التحميل...\n🎵 *{track['title']}*", parse_mode="Markdown")
-        file_path, dl_title, _ = await loop.run_in_executor(
-            None, nogomistars_download, track["dl_url"], track["title"])
-        if file_path and os.path.exists(file_path):
+    wait_msg = await msg.reply_text("⏳ جاري التحضير...")
+    file_path, title = await _download_tg_audio(reply, context.bot)
+
+    if not file_path:
+        await wait_msg.edit_text("❌ ما قدرت أحمّل الملف الصوتي.")
+        return
+
+    await wait_msg.delete()
+
+    q = _vc_queue.setdefault(chat_id, [])
+    item = {"file": file_path, "title": title, "user_id": user_id}
+    q.append(item)
+
+    if len(q) > 1:
+        await msg.reply_text(f"➕ أُضيفت للطابور (#{len(q)}): *{title}*", parse_mode="Markdown")
+        return
+
+    result = await voice_svc.join_and_play(chat_id, file_path)
+    if not result["ok"]:
+        err = result.get("error", "خطأ غير معروف")
+        await msg.reply_text(f"❌ فشل التشغيل:\n`{err[:300]}`", parse_mode="Markdown")
+        q.pop()
+        if os.path.exists(file_path):
             try:
-                artist, song_title = split_artist_title(dl_title)
-                ok2, file_id = await send_audio_file(context.bot, msg.chat_id, file_path,
-                    title=song_title or dl_title, duration_str="", performer=artist)
-                if ok2:
-                    if file_id: cache_set(query, file_id)
-                    await wait_msg.delete()
-                else:
-                    await wait_msg.edit_text("❌ حدث خطأ أثناء الإرسال.")
-                return
-            finally:
-                if os.path.exists(file_path):
-                    try: os.unlink(file_path)
-                    except Exception: pass
-        yt_id2 = track.get("yt_id")
-        if yt_id2:
-            ok = await _download_and_send_yt(f"https://www.youtube.com/watch?v={yt_id2}",
-                wait_msg, msg.chat_id, context, cache_key=query)
-            if ok:
-                return
+                os.unlink(file_path)
+            except Exception:
+                pass
+        return
 
-    await wait_msg.edit_text("❌ ما لقيت الأغنية، جرب كلمة ثانية.")
+    _vc_playing[chat_id] = item
+    _vc_paused[chat_id] = False
+    await _vc_send_ctrl(context.bot, chat_id, title)
+
+
+async def _download_tg_audio(reply_msg, bot) -> tuple[str | None, str]:
+    """
+    يحمّل ملف صوتي من رسالة تلغرام (رد على أغنية).
+    يرجع (file_path, title) أو (None, "").
+    """
+    audio = (
+        reply_msg.audio
+        or reply_msg.voice
+        or reply_msg.document
+    )
+    if not audio:
+        return None, ""
+    title = ""
+    if hasattr(audio, "title") and audio.title:
+        title = audio.title
+    elif hasattr(audio, "file_name") and audio.file_name:
+        title = audio.file_name
+    else:
+        title = "صوت"
+    try:
+        tg_file = await bot.get_file(audio.file_id)
+        fd, path = tempfile.mkstemp(suffix=".mp3")
+        os.close(fd)
+        await tg_file.download_to_drive(path)
+        if os.path.getsize(path) < 1024:
+            os.unlink(path)
+            return None, ""
+        return path, title
+    except Exception as e:
+        logger.error(f"_download_tg_audio error: {e}")
+        return None, ""
 
 
 # ─── Telegram Handlers ────────────────────────────────────────────────────────
@@ -1543,10 +1553,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text.startswith("شغل "):
         query     = text[4:].strip()
         is_shaghl = True
-    elif text in ("بحث", "يوت", "شغل"):
+    elif text == "شغل":
+        # رد على رسالة صوتية → شغلها في المكالمة
+        reply = msg.reply_to_message
+        if reply and (reply.audio or reply.voice or reply.document):
+            is_shaghl = True
+            # سيتم التعامل معها في بلوك is_shaghl أدناه بدون query
+        else:
+            await msg.reply_text(
+                "اكتب اسم الأغنية بعد شغل أو رد على أغنية بـ *شغل*\n"
+                "مثال: `شغل طلال مداح`",
+                parse_mode="Markdown",
+            )
+            return
+    elif text in ("بحث", "يوت"):
         await msg.reply_text(
             "اكتب اسم الأغنية بعد الأمر\n"
-            "مثال: `بحث طلال مداح` أو `يوت محمد عبده` أو `شغل طلال مداح`",
+            "مثال: `بحث طلال مداح` أو `يوت محمد عبده`",
             parse_mode="Markdown",
         )
         return
@@ -1555,12 +1578,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         query = text
 
-    if not query:
+    if not query and not is_shaghl:
         return
 
     # ── شغل: تشغيل في مكالمة صوتية ─────────────────────────────────
     if is_shaghl:
-        await cmd_shaghl(msg, query, context)
+        if query:
+            # شغل [اسم الأغنية]
+            await cmd_shaghl(msg, query, context)
+        else:
+            # رد على رسالة صوتية بكلمة "شغل"
+            await cmd_shaghl_reply(msg, context)
         return
 
     # ── يوت: فوري ──────────────────────────────────────────────────
